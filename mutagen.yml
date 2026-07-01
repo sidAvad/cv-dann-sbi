@@ -1,7 +1,7 @@
 sync:
-  cv-sbi-adamant:
+  cv-dann-sbi-adamant:
     alpha: "."
-    beta: "sa4604@adamant:~/cv-sbi"
+    beta: "sa4604@adamant:~/cv-dann-sbi"
     mode: "two-way-resolved"
     ignore:
       paths:
@@ -15,3 +15,4 @@ sync:
         - "*.log"
         - ".DS_Store"
         - "nohup.out"
+        - "notebooks/"
