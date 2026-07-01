@@ -33,27 +33,46 @@ Forked from `cv-inverse-autoencoder` (the surrogate training repo).
 
 ## Run naming convention
 
-NPE runs (train_sbi.py): `{type}_{series}_{embedding}_{flow}_{training-method}`
-Domain adaptation runs (train_mmd.py, train_ot.py): `{type}_{series}_{embedding}_{1M}_{method}`
+Joint training runs: `{type}-v{version}_{encoder-type}_{objective}`
 
-- type: `exp` (full run) or `dry` (512 sims, smoke test, no posterior saved)
-- embedding: `cnn4e64` (4-block CNN, 64-dim), `sumstats` (hand-crafted summary stats), etc.
-- flow (NPE only): `maf5` (MAF, 5 transforms), `nsf8`, etc.
-- training-method (NPE only): describes what is frozen/ablated, e.g. `freeze-maf`, `freeze-input`
-- method (domain adaptation): describes the adaptation approach, e.g. `mmd-multibeat-adaptive`, `ot-sinkhorn-warm`
+- `type`: `exp` (full run) or `dry` (512 sims, smoke test)
+- `v{version}`: version string — use integers for major variants (`v1`, `v2`), decimals for minor tweaks (`v1.1`, `v1.2`); stored verbatim in `run_info.json` as `"version": "1.1"`
+- `encoder-type`: `encoder-lipschitz` or `encoder-vae`
+- `objective`: `flow-maf5`, `flow-nsf8`, or `reconstruction`
 
 Examples:
-- NPE: `exp_cnn4e64-ae-reduced_maf5_freeze-maf_1M`
-- MMD: `exp_cnn4e64-ae-reduced_1M_mmd-multibeat-adaptive`
-- OT:  `exp_cnn4e64-ae-reduced_1M_ot-sinkhorn-warm`
+- `exp-v1_encoder-lipschitz_flow-maf5`
+- `exp-v1.1_encoder-lipschitz_flow-maf5`
+- `exp-v1_encoder-lipschitz_reconstruction`
+- `exp-v1_encoder-vae_flow-maf5`
+- `dry-v1_encoder-lipschitz_flow-maf5`
 
 ## Experiment tracking
 
 - `outputs/{run_name}/` — full runs (gitignored)
 - `dry-runs/{run_name}/` — dry runs (gitignored)
-- Each run writes `run_info.json` (git hash, config, architecture) and `train_log.txt`
+- Each run writes `run_info_v{version}.json` (e.g. `run_info_v1.1.json`) containing git hash, config, architecture, and `"version"` field; also writes `train_log.txt`
 - **Always commit before starting an `exp_` run** so `run_info.json` captures the exact code
 - **Always confirm the output run name/directory with the user before executing any training run** — never assume the name is correct, especially for variant runs that could overwrite existing results.
+
+## Experiment plan
+
+Goal: joint training of encoder + DANN domain adaptation + inference objective over 4 permutations.
+
+| # | Encoder | Objective | Run name |
+|---|---------|-----------|----------|
+| 1 | lipschitz | flow-maf5 | `exp-v1_encoder-lipschitz_flow-maf5` |
+| 2 | lipschitz | reconstruction | `exp-v1_encoder-lipschitz_reconstruction` |
+| 3 | vae | flow-maf5 | `exp-v1_encoder-vae_flow-maf5` |
+| 4 | vae | reconstruction | `exp-v1_encoder-vae_reconstruction` |
+
+Start with experiments 1 & 2 (Lipschitz encoder already exists). Build VAE encoder before 3 & 4.
+
+### What needs to be built
+
+1. **DANN components** (`models.py`): `GradientReversalLayer` + `DomainClassifier`
+2. **Joint training script** (`train_joint.py`): encoder + DANN + flow or reconstruction objective end-to-end; writes `version` field to `run_info.json`
+3. **VAE encoder** (`models.py`): stochastic encoder with reparameterisation (for experiments 3 & 4)
 
 ## Git conventions
 
