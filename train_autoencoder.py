@@ -1,21 +1,26 @@
 """
-Phases 1 and 2 of autoencoder pre-training for cv-sbi.
+Phases 1 and 2 of autoencoder pre-training for cv-sbi (v3 architecture).
 
-Phase 1: AutoencoderEncoder (full 28-ch CNN) + WaveformDecoder trained to
-         reconstruct all 28 waveforms from a 128-dim latent (MSE loss).
-         Trains to convergence via early stopping on val MSE.
+Phase 1: AutoencoderEncoder (24-ch CNN) + WaveformDecoder(n_layers=3, out_channels=N_CONT)
+         trained to reconstruct the 24 continuous waveform channels from a
+         latent_dim-dimensional latent (MSE + smoothness loss).
          Saves: phase1_encoder.pt, phase1_decoder.pt
 
 Phase 2: Load phase1_decoder.pt and freeze it. Train ReducedAutoencoderEncoder
-         (4-ch pressure CNN + 5 scalar prefix tokens → 128-dim) to reconstruct
-         full waveforms through the frozen decoder (MSE loss, early stopping).
+         (4-ch pressure CNN + 5 scalar prefix tokens → latent_dim) to reconstruct
+         the 24 continuous waveform channels through the frozen decoder.
          Saves: phase2_encoder.pt
+
+Use --lipschitz to apply spectral-norm ceiling to the phase 2 encoder.
+Use --proj-hidden to add a two-stage projection in the phase 2 encoder (e.g. 128 for 64-dim latent).
 
 After this script, run train_sbi.py --embedding ae-reduced to execute phases 3+4.
 
 Usage:
-    python train_autoencoder.py --run exp_cnn4e64-ae-reduced_maf5_freeze-maf --data-root /path/to/data
-    python train_autoencoder.py --run dry_cnn4e64-ae-reduced_maf5_freeze-maf --data-root /path/to/data
+    python train_autoencoder.py \\
+        --run exp_cnn4e64-lipschitz-ae-reduced_1M \\
+        --data-root /path/to/data \\
+        --latent-dim 64 --lipschitz --proj-hidden 128 --smoothness-weight 0.1
 """
 
 import argparse
@@ -32,23 +37,31 @@ from torch.utils.data import DataLoader, TensorDataset, random_split
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
+import torch.nn.functional as F
+
 from dataset import (
     CVDataset, PairedCVDataset,
     load_stats, load_manifest,
+    N_CONT, T as T_STEPS,
 )
-from models import AutoencoderEncoder, ReducedAutoencoderEncoder, WaveformDecoder, LATENT_DIM
+from models import (
+    AutoencoderEncoder,
+    ReducedAutoencoderEncoder, LipschitzReducedAutoencoderEncoder,
+    WaveformDecoder, LATENT_DIM,
+)
 
 
 STATS_PATH        = Path("norm_stats.json")
 N_SIMS_DEFAULT    = 100_000
 N_SIMS_DRY        = 512
 BATCH_SIZE        = 512
-PHASE1_MAX_EPOCHS = 150
-PHASE2_MAX_EPOCHS = 100
+PHASE1_MAX_EPOCHS = 300
+PHASE2_MAX_EPOCHS = 200
 PATIENCE          = 15
 VAL_FRAC          = 0.1
 LR                = 1e-3
 DEVICE            = "cuda" if torch.cuda.is_available() else "cpu"
+N_CONT_T          = N_CONT * T_STEPS  # 24 * 201 = 4824
 
 
 def git_hash():
@@ -127,16 +140,31 @@ def make_loaders(tensor_ds):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run",       required=True,
-                        help="e.g. exp_cnn4e64-ae-reduced_maf5_freeze-maf")
+                        help="e.g. exp_cnn4e64-lipschitz-ae-reduced_1M")
     parser.add_argument("--data-root", required=True,
                         help="Dataset root containing train/ and manifest_train.json")
-    parser.add_argument("--n-sims", type=int, default=None,
+    parser.add_argument("--n-sims",           type=int,   default=None,
                         help="Number of simulations (dry runs always 512; full runs default 100k)")
+    parser.add_argument("--latent-dim",       type=int,   default=LATENT_DIM,
+                        help=f"Latent space dimensionality (default: {LATENT_DIM})")
+    parser.add_argument("--hidden",           type=int,   default=512,
+                        help="Decoder hidden width (default: 512)")
+    parser.add_argument("--n-layers",         type=int,   default=3,
+                        help="Decoder depth (default: 3)")
+    parser.add_argument("--smoothness-weight",type=float, default=0.01,
+                        help="Weight on TV smoothness penalty (default: 0.01)")
+    parser.add_argument("--lipschitz",        action="store_true",
+                        help="Apply soft spectral-norm ceiling to the phase 2 encoder")
+    parser.add_argument("--sn-ceiling",       type=float, default=2.0,
+                        help="Spectral-norm ceiling per layer (default: 2.0, only with --lipschitz)")
+    parser.add_argument("--proj-hidden",      type=int,   default=None,
+                        help="Hidden dim for two-stage projection in phase 2 encoder "
+                             "(e.g. 128 for latent_dim=64). Default: single linear.")
     args = parser.parse_args()
 
     run_type, run_name, run_dir = parse_run(args.run)
     is_dry    = run_type == "dry"
-    n_sims    = N_SIMS_DRY if is_dry else (args.n_sims or N_SIMS_DEFAULT)
+    n_sims    = args.n_sims if args.n_sims else (N_SIMS_DRY if is_dry else N_SIMS_DEFAULT)
     data_root = Path(args.data_root)
     data_dir  = data_root / "train"
     manifest_path = data_root / "manifest_train.json"
@@ -155,7 +183,10 @@ def main():
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
     log(f"Run: {run_name}  ({'dry' if is_dry else 'full'})")
-    log(f"Device: {DEVICE}  latent_dim: {LATENT_DIM}")
+    log(f"Device: {DEVICE}  latent_dim: {args.latent_dim}  lipschitz: {args.lipschitz}"
+        + (f"  sn_ceiling: {args.sn_ceiling}" if args.lipschitz else "")
+        + (f"  proj_hidden: {args.proj_hidden}" if args.proj_hidden else ""))
+    log(f"Decoder: hidden={args.hidden}  n_layers={args.n_layers}  smoothness_weight={args.smoothness_weight}")
     log(f"Phase 1: max {PHASE1_MAX_EPOCHS} epochs, Phase 2: max {PHASE2_MAX_EPOCHS} epochs")
     log(f"lr: {LR}  patience: {PATIENCE}  val_frac: {VAL_FRAC}")
 
@@ -163,44 +194,62 @@ def main():
     stats    = load_stats(STATS_PATH)
     index    = manifest["index"][:n_sims]
 
-    # ── Phase 1: full encoder + decoder ──────────────────────────────────────
+    def ae_loss(pred, tgt):
+        """MSE on 24 cont channels + TV smoothness penalty. pred/tgt: (B, N_CONT, T)."""
+        mse_val    = F.mse_loss(pred, tgt)
+        smooth_val = (pred[..., 1:] - pred[..., :-1]).pow(2).mean()
+        return mse_val + args.smoothness_weight * smooth_val, mse_val, smooth_val
+
+    # ── Phase 1: full-24ch encoder + decoder ─────────────────────────────────
     log("Phase 1: loading full data into RAM...")
     x_full_all = load_full_data(data_dir, index, stats, log)
     train1, val1 = make_loaders(TensorDataset(x_full_all))
 
-    enc1 = AutoencoderEncoder(latent_dim=LATENT_DIM).to(DEVICE)
-    dec  = WaveformDecoder(latent_dim=LATENT_DIM).to(DEVICE)
+    enc1 = AutoencoderEncoder(latent_dim=args.latent_dim).to(DEVICE)
+    dec  = WaveformDecoder(latent_dim=args.latent_dim, hidden=args.hidden,
+                           n_layers=args.n_layers, out_channels=N_CONT).to(DEVICE)
+    log(f"  phase 1 encoder: AutoencoderEncoder")
     log(f"  encoder params: {sum(p.numel() for p in enc1.parameters()):,}")
     log(f"  decoder params: {sum(p.numel() for p in dec.parameters()):,}")
 
     opt1 = torch.optim.Adam(list(enc1.parameters()) + list(dec.parameters()), lr=LR)
-    mse  = nn.MSELoss()
 
     best_val1, wait1, phase1_epochs_run = float("inf"), 0, 0
     for epoch in range(1, PHASE1_MAX_EPOCHS + 1):
         enc1.train(); dec.train()
         train_loss = 0.0; n_train = 0
         for (x_batch,) in train1:
-            x_batch = x_batch.to(DEVICE)
-            loss    = mse(dec(enc1(x_batch)), x_batch)
+            x_batch  = x_batch.to(DEVICE)
+            x_cont   = x_batch[:, :N_CONT_T]                        # (B, N_CONT*T)
+            tgt      = x_cont.view(len(x_batch), N_CONT, T_STEPS)   # (B, N_CONT, T)
+            pred     = dec(enc1(x_cont)).view(len(x_batch), N_CONT, T_STEPS)
+            loss, _, _ = ae_loss(pred, tgt)
             opt1.zero_grad(); loss.backward(); opt1.step()
             train_loss += loss.item() * len(x_batch); n_train += len(x_batch)
 
         enc1.eval(); dec.eval()
-        val_loss = 0.0; n_val = 0
+        val_mse_sum = val_smooth_sum = 0.0; n_val = 0
         with torch.no_grad():
             for (x_batch,) in val1:
-                x_batch   = x_batch.to(DEVICE)
-                val_loss  += mse(dec(enc1(x_batch)), x_batch).item() * len(x_batch)
-                n_val     += len(x_batch)
+                x_batch = x_batch.to(DEVICE)
+                x_cont  = x_batch[:, :N_CONT_T]
+                tgt     = x_cont.view(len(x_batch), N_CONT, T_STEPS)
+                pred_v  = dec(enc1(x_cont)).view(len(x_batch), N_CONT, T_STEPS)
+                _, mse_v, smooth_v = ae_loss(pred_v, tgt)
+                val_mse_sum    += mse_v.item()    * len(x_batch)
+                val_smooth_sum += smooth_v.item() * len(x_batch)
+                n_val          += len(x_batch)
 
-        train_mse = train_loss / n_train
-        val_mse   = val_loss   / n_val
+        val_mse    = val_mse_sum    / n_val
+        val_smooth = val_smooth_sum / n_val
+        val_total  = val_mse + args.smoothness_weight * val_smooth
         phase1_epochs_run = epoch
-        log(f"  epoch {epoch:3d}/{PHASE1_MAX_EPOCHS}  train={train_mse:.4f}  val={val_mse:.4f}")
 
-        if val_mse < best_val1:
-            best_val1 = val_mse
+        log(f"  epoch {epoch:3d}/{PHASE1_MAX_EPOCHS}  "
+            f"val_mse={val_mse:.4f}  val_smooth={val_smooth:.4f}  val_total={val_total:.4f}")
+
+        if val_total < best_val1:
+            best_val1 = val_total
             wait1     = 0
             torch.save(enc1.state_dict(), run_dir / "phase1_encoder.pt")
             torch.save(dec.state_dict(),  run_dir / "phase1_decoder.pt")
@@ -221,7 +270,19 @@ def main():
     x_full_p2, x_red_p2 = load_paired_data(data_dir, index, stats, log)
     train2, val2 = make_loaders(TensorDataset(x_full_p2, x_red_p2))
 
-    enc2 = ReducedAutoencoderEncoder(latent_dim=LATENT_DIM).to(DEVICE)
+    if args.lipschitz:
+        enc2 = LipschitzReducedAutoencoderEncoder(
+            latent_dim=args.latent_dim, sn_ceiling=args.sn_ceiling,
+            proj_hidden=args.proj_hidden,
+        ).to(DEVICE)
+        log(f"  phase 2 encoder: LipschitzReducedAutoencoderEncoder  sn_ceiling={args.sn_ceiling}"
+            + (f"  proj_hidden={args.proj_hidden}" if args.proj_hidden else ""))
+    else:
+        enc2 = ReducedAutoencoderEncoder(
+            latent_dim=args.latent_dim, proj_hidden=args.proj_hidden,
+        ).to(DEVICE)
+        log(f"  phase 2 encoder: ReducedAutoencoderEncoder"
+            + (f"  proj_hidden={args.proj_hidden}" if args.proj_hidden else ""))
     dec.requires_grad_(False)
     log(f"  reduced encoder params: {sum(p.numel() for p in enc2.parameters()):,}")
 
@@ -232,28 +293,41 @@ def main():
         enc2.train(); dec.eval()
         train_loss = 0.0; n_train = 0
         for x_full_b, x_red_b in train2:
-            x_full_b  = x_full_b.to(DEVICE)
-            x_red_b   = x_red_b.to(DEVICE)
-            loss      = mse(dec(enc2(x_red_b)), x_full_b)
+            x_full_b = x_full_b.to(DEVICE)
+            x_red_b  = x_red_b.to(DEVICE)
+            tgt      = x_full_b[:, :N_CONT_T].view(len(x_full_b), N_CONT, T_STEPS)
+            pred     = dec(enc2(x_red_b)).view(len(x_full_b), N_CONT, T_STEPS)
+            loss, _, _ = ae_loss(pred, tgt)
             opt2.zero_grad(); loss.backward(); opt2.step()
             train_loss += loss.item() * len(x_full_b); n_train += len(x_full_b)
 
         enc2.eval()
-        val_loss = 0.0; n_val = 0
+        val_mse_sum = val_smooth_sum = 0.0; n_val = 0
         with torch.no_grad():
             for x_full_b, x_red_b in val2:
                 x_full_b = x_full_b.to(DEVICE)
                 x_red_b  = x_red_b.to(DEVICE)
-                val_loss += mse(dec(enc2(x_red_b)), x_full_b).item() * len(x_full_b)
-                n_val    += len(x_full_b)
+                tgt      = x_full_b[:, :N_CONT_T].view(len(x_full_b), N_CONT, T_STEPS)
+                pred_v   = dec(enc2(x_red_b)).view(len(x_full_b), N_CONT, T_STEPS)
+                _, mse_v, smooth_v = ae_loss(pred_v, tgt)
+                val_mse_sum    += mse_v.item()    * len(x_full_b)
+                val_smooth_sum += smooth_v.item() * len(x_full_b)
+                n_val          += len(x_full_b)
 
-        train_mse = train_loss / n_train
-        val_mse   = val_loss   / n_val
+        val_mse    = val_mse_sum    / n_val
+        val_smooth = val_smooth_sum / n_val
+        val_total  = val_mse + args.smoothness_weight * val_smooth
         phase2_epochs_run = epoch
-        log(f"  epoch {epoch:3d}/{PHASE2_MAX_EPOCHS}  train={train_mse:.4f}  val={val_mse:.4f}")
 
-        if val_mse < best_val2:
-            best_val2 = val_mse
+        sn_str = ""
+        if args.lipschitz and epoch % 10 == 0:
+            sn_max = max(enc2.spectral_norms().values())
+            sn_str = f"  sn_max={sn_max:.3f}"
+        log(f"  epoch {epoch:3d}/{PHASE2_MAX_EPOCHS}  "
+            f"val_mse={val_mse:.4f}  val_smooth={val_smooth:.4f}  val_total={val_total:.4f}{sn_str}")
+
+        if val_total < best_val2:
+            best_val2 = val_total
             wait2     = 0
             torch.save(enc2.state_dict(), run_dir / "phase2_encoder.pt")
         else:
@@ -273,10 +347,16 @@ def main():
         device=DEVICE,
         data=dict(n_sims=n_sims, data_dir=str(data_dir)),
         model=dict(
-            encoder="AutoencoderEncoder",
-            reduced_encoder="ReducedAutoencoderEncoder",
+            phase1_encoder="AutoencoderEncoder",
+            phase2_encoder="LipschitzReducedAutoencoderEncoder" if args.lipschitz else "ReducedAutoencoderEncoder",
             decoder="WaveformDecoder",
-            latent_dim=LATENT_DIM,
+            latent_dim=args.latent_dim,
+            proj_hidden=args.proj_hidden,
+            decoder_hidden=args.hidden,
+            decoder_n_layers=args.n_layers,
+            decoder_out_channels=N_CONT,
+            lipschitz=args.lipschitz,
+            sn_ceiling=args.sn_ceiling if args.lipschitz else None,
         ),
         training=dict(
             phase1_epochs_run=phase1_epochs_run,
@@ -289,6 +369,7 @@ def main():
             val_frac=VAL_FRAC,
             batch_size=BATCH_SIZE,
             lr=LR,
+            smoothness_weight=args.smoothness_weight,
         ),
     )
     (run_dir / "ae_info.json").write_text(json.dumps(ae_info, indent=2))

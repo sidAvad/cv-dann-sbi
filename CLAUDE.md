@@ -17,7 +17,7 @@ Forked from `cv-inverse-autoencoder` (the surrogate training repo).
 ## Data layout
 
 - HDF5 files under `<data-root>/train/` and `<data-root>/test/`; pass the root via `--data-root`
-  - Adamant: `/media/pulsar/SimData/hdf5/cv8/simset_10M_cv8Eed_20260314`
+  - Adamant: `/media/local/SimData/hdf5/cv8/simset_10M_cv8Eed_20260314` (local NVMe — use this, not `/media/pulsar/` which is a slow network share)
 - `manifest_train.json` / `manifest_test.json` live at `<data-root>/` (one level above the data dirs)
 - Each HDF5 group (`sim_NNNNNN`) holds `parameters/<key>` scalars and `waves/<key>` arrays of length 201
 - `norm_stats.json`: wave normalisation stats (not committed)
@@ -33,14 +33,19 @@ Forked from `cv-inverse-autoencoder` (the surrogate training repo).
 
 ## Run naming convention
 
-`{type}_{series}_{embedding}_{flow}[_{extras}]`
+NPE runs (train_sbi.py): `{type}_{series}_{embedding}_{flow}_{training-method}`
+Domain adaptation runs (train_mmd.py, train_ot.py): `{type}_{series}_{embedding}_{1M}_{method}`
 
 - type: `exp` (full run) or `dry` (512 sims, smoke test, no posterior saved)
 - embedding: `cnn4e64` (4-block CNN, 64-dim), `sumstats` (hand-crafted summary stats), etc.
-- flow: `maf5` (MAF, 5 transforms), `nsf8`, etc.
-- training-method: describes what is frozen/ablated, e.g. `freeze-maf`, `freeze-input`, `ablate`
+- flow (NPE only): `maf5` (MAF, 5 transforms), `nsf8`, etc.
+- training-method (NPE only): describes what is frozen/ablated, e.g. `freeze-maf`, `freeze-input`
+- method (domain adaptation): describes the adaptation approach, e.g. `mmd-multibeat-adaptive`, `ot-sinkhorn-warm`
 
-Examples: `exp_cnn4e64_maf5_freeze-maf`, `dry_sumstats_maf5`
+Examples:
+- NPE: `exp_cnn4e64-ae-reduced_maf5_freeze-maf_1M`
+- MMD: `exp_cnn4e64-ae-reduced_1M_mmd-multibeat-adaptive`
+- OT:  `exp_cnn4e64-ae-reduced_1M_ot-sinkhorn-warm`
 
 ## Experiment tracking
 
