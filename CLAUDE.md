@@ -57,22 +57,16 @@ Examples:
 
 ## Experiment plan
 
-Goal: joint training of encoder + DANN domain adaptation + inference objective over 4 permutations.
+Goal: joint training of encoder + DANN + inference objective (train_joint.py).
 
-| # | Encoder | Objective | Run name |
-|---|---------|-----------|----------|
-| 1 | lipschitz | flow-maf5 | `exp-v1_encoder-lipschitz_flow-maf5` |
-| 2 | lipschitz | reconstruction | `exp-v1_encoder-lipschitz_reconstruction` |
-| 3 | vae | flow-maf5 | `exp-v1_encoder-vae_flow-maf5` |
-| 4 | vae | reconstruction | `exp-v1_encoder-vae_reconstruction` |
+| # | Encoder | Objective | Run name | Status |
+|---|---------|-----------|----------|--------|
+| 1 | lipschitz | flow-maf5 | `exp-v1_encoder-lipschitz_flow-maf5` | next |
+| 2 | lipschitz | reconstruction | `exp-v1_encoder-lipschitz_reconstruction` | after 1 |
+| 3 | vae | flow-maf5 | `exp-v1_encoder-vae_flow-maf5` | future |
+| 4 | vae | reconstruction | `exp-v1_encoder-vae_reconstruction` | future |
 
-Start with experiments 1 & 2 (Lipschitz encoder already exists). Build VAE encoder before 3 & 4.
-
-### What needs to be built
-
-1. **DANN components** (`models.py`): `GradientReversalLayer` + `DomainClassifier`
-2. **Joint training script** (`train_joint.py`): encoder + DANN + flow or reconstruction objective end-to-end; writes `version` field to `run_info.json`
-3. **VAE encoder** (`models.py`): stochastic encoder with reparameterisation (for experiments 3 & 4)
+Experiments 1 & 2 use `train_joint.py` (Lipschitz encoder, built). VAE encoder not yet implemented.
 
 ## Git conventions
 

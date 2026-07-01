@@ -10,6 +10,10 @@ AE pre-training components:
   ReducedAutoencoderEncoder         : 4-ch CNN + scalar prefix tokens → latent_dim, phase 2
   LipschitzReducedAutoencoderEncoder: same as above + soft spectral-norm ceiling per layer
   WaveformDecoder                   : latent_dim → MLP → out_channels*T, phases 1 + 2
+
+Joint training components (train_joint.py):
+  GradientReversalLayer : reverses gradient with scale alpha (DANN)
+  DomainClassifier      : MLP binary classifier, sim=0 / real=1; use after GRL
 """
 
 import torch
@@ -412,3 +416,133 @@ class WaveformDecoder(nn.Module):
 
     def forward(self, z):
         return self.net(z)
+
+
+# ── DANN components ───────────────────────────────────────────────────────────
+
+class _GradientReversalFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.alpha * grad_output, None
+
+
+class GradientReversalLayer(nn.Module):
+    """Passes activations unchanged; reverses and scales gradients on backward."""
+
+    def __init__(self, alpha: float = 1.0):
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _GradientReversalFunction.apply(x, self.alpha)
+
+
+class DomainClassifier(nn.Module):
+    """Binary domain classifier: sim (label=0) vs real (label=1).
+
+    Outputs un-normalised logits, shape (B,). Use with BCEWithLogitsLoss.
+    Attach after GradientReversalLayer for DANN adversarial encoder training.
+    """
+
+    def __init__(self, latent_dim: int, hidden: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden),     nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def describe(self):
+        return {
+            "type": "DomainClassifier",
+            "latent_dim": self.net[0].in_features,
+            "hidden": self.net[0].out_features,
+            "n_params": sum(p.numel() for p in self.parameters()),
+        }
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z).squeeze(-1)
+
+
+# ── VAE encoder ───────────────────────────────────────────────────────────────
+
+class VAEReducedAutoencoderEncoder(nn.Module):
+    """Stochastic (VAE-style) variant of ReducedAutoencoderEncoder.
+
+    forward() returns (z, mu, log_var):
+      Training: z = mu + eps * exp(0.5 * log_var)  [reparameterization]
+      Eval:     z = mu,  log_var = zeros            [deterministic mean]
+
+    KL loss: -0.5 * sum(1 + log_var - mu^2 - exp(log_var))
+    Compute and scale by beta in the training loop.
+    """
+
+    CONV_LAYERS = ReducedAutoencoderEncoder.CONV_LAYERS
+
+    def __init__(self, latent_dim: int = LATENT_DIM, proj_hidden: int = None):
+        super().__init__()
+        self.latent_dim  = latent_dim
+        self.proj_hidden = proj_hidden
+        self.wave_len    = N_REDUCED_CHANNELS * T
+        feat_dim = self.CONV_LAYERS[-1][1]
+
+        layers = []
+        for in_ch, out_ch, k, s in self.CONV_LAYERS:
+            layers += [nn.Conv1d(in_ch, out_ch, kernel_size=k, padding=k // 2, stride=s), nn.SiLU()]
+        self.cnn          = nn.Sequential(*layers)
+        self.scalar_projs = nn.ModuleList([nn.Linear(1, feat_dim) for _ in range(N_SCALARS)])
+        self.attn_pool    = nn.Linear(feat_dim, 1)
+
+        proj_in = feat_dim
+        if proj_hidden is not None:
+            self.proj = nn.Linear(feat_dim, proj_hidden)
+            proj_in   = proj_hidden
+        else:
+            self.proj = None
+
+        self.fc_mu      = nn.Linear(proj_in, latent_dim)
+        self.fc_log_var = nn.Linear(proj_in, latent_dim)
+
+    @property
+    def output_dim(self):
+        return self.latent_dim
+
+    def describe(self):
+        return {
+            "type": "VAEReducedAutoencoderEncoder",
+            "input_waveforms": f"({N_REDUCED_CHANNELS}, {T})",
+            "input_scalars": "Pas_mean, Pas_max, Pas_min, SV, HR_z",
+            "latent_dim": self.latent_dim,
+            "proj_hidden": self.proj_hidden,
+            "n_params": sum(p.numel() for p in self.parameters()),
+        }
+
+    def _features(self, x: torch.Tensor) -> torch.Tensor:
+        waves   = x[:, :self.wave_len].view(-1, N_REDUCED_CHANNELS, T)
+        scalars = x[:, self.wave_len:]
+        h = self.cnn(waves).transpose(1, 2)
+        scalar_tokens = torch.stack(
+            [proj(scalars[:, i:i+1]) for i, proj in enumerate(self.scalar_projs)],
+            dim=1,
+        )
+        h = torch.cat([scalar_tokens, h], dim=1)
+        w = self.attn_pool(h).softmax(dim=1)
+        return (w * h).sum(dim=1)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        h = self._features(x)
+        if self.proj is not None:
+            h = F.silu(self.proj(h))
+        mu      = self.fc_mu(h)
+        log_var = self.fc_log_var(h)
+        if self.training:
+            z = mu + (0.5 * log_var).exp() * torch.randn_like(mu)
+        else:
+            z       = mu
+            log_var = torch.zeros_like(mu)
+        return z, mu, log_var
