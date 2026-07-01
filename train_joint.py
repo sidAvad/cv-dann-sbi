@@ -1,21 +1,20 @@
 """
 Joint training: LipschitzReducedAutoencoderEncoder + DANN + task head.
 
-Objective (per batch):
-  L = L_task  +  λ · L_domain(z_sim, z_real)
+Four-phase training schedule:
 
-  L_task = -E[log p_flow(θ|z)]         --objective flow-maf5 / flow-nsf8
-         = E[||decoder(z) - x_waves||²] --objective reconstruction
+  Phase 0  flow-warmup    encoder frozen, flow trains         (sim only)
+  Phase 1  enc-warmup     flow frozen, encoder trains         (sim only)
+  Phase 2  joint-sim      encoder + flow jointly, λ=0        (sim only)
+  Phase 3  joint-dann     encoder + flow + DANN, λ ramps up  (sim + real)
 
-  L_domain uses GradientReversalLayer so the encoder is trained adversarially.
-
-Phase schedule:
-  Phase 1 (epoch 1 .. --phase1-epochs):           λ = 0           (task only, sim data)
-  Phase 2 (.. --phase1-epochs + --phase2-epochs):  λ = lambda-p2  (light domain pressure)
-  Phase 3 (.. --max-epochs):                       λ = lambda      (full joint objective)
+Separate Adam optimizers for encoder, flow, and domain classifier.
+Each optimizer steps only in phases where its component is active.
+λ ramps linearly 0 → --lambda over --lambda-warmup epochs at the start of phase 3.
+Early stopping on total loss, patience counted from the start of phase 3.
 
 Run names: exp-v{N}_encoder-lipschitz_{flow-maf5|flow-nsf8|reconstruction}
-run_info written to: outputs/{run}/run_info_v{version}.json
+run_info:  outputs/{run}/run_info_v{version}.json
 
 Usage:
     python train_joint.py \\
@@ -106,18 +105,6 @@ def parse_run(name: str):
         raise ValueError("--run must start with 'exp-' or 'dry-'")
 
 
-# ─── Phase schedule ───────────────────────────────────────────────────────────
-
-def get_lambda(epoch: int, phase1_end: int, phase2_end: int,
-               lambda_p2: float, lambda_target: float) -> float:
-    if epoch <= phase1_end:
-        return 0.0
-    elif epoch <= phase2_end:
-        return lambda_p2
-    else:
-        return lambda_target
-
-
 # ─── Data loading ─────────────────────────────────────────────────────────────
 
 def load_sim_data(data_dir: Path, manifest: dict, stats: dict, n: int, log):
@@ -182,8 +169,8 @@ def build_flow_net(objective: str, latent_dim: int, theta_stats: torch.Tensor,
                    hidden_features: int, num_transforms: int) -> nn.Module:
     """Build MAF or NSF via sbi's posterior_nn with identity embedding.
 
-    The returned module accepts log_prob(theta, context=z) where z is our
-    encoded latent. z_score stats for theta are fitted to theta_stats.
+    The returned module exposes log_prob(theta, context=z) where z is our
+    latent. z_score stats for theta are fitted to theta_stats.
     """
     model    = "maf" if "maf" in objective else "nsf"
     build_fn = posterior_nn(
@@ -222,21 +209,24 @@ def main():
                         help="Default: 128 for MAF, 256 for NSF")
     parser.add_argument("--num-transforms",  type=int, default=None,
                         help="Default: 5 for MAF, 8 for NSF")
-    # Phase schedule
-    parser.add_argument("--phase1-epochs",  type=int,   default=20,
-                        help="Epochs with λ=0 — task only on sim data")
-    parser.add_argument("--phase2-epochs",  type=int,   default=30,
-                        help="Warmup epochs with λ=lambda-p2")
-    parser.add_argument("--max-epochs",     type=int,   default=200)
+    # Phase schedule (cumulative epoch counts)
+    parser.add_argument("--flow-warmup",    type=int, default=2,
+                        help="Phase 0: epochs training flow only (encoder frozen)")
+    parser.add_argument("--enc-warmup",     type=int, default=10,
+                        help="Phase 1: epochs training encoder only (flow frozen)")
+    parser.add_argument("--joint-sim",      type=int, default=20,
+                        help="Phase 2: epochs of joint sim training before DANN is introduced")
+    parser.add_argument("--lambda-warmup",  type=int, default=20,
+                        help="Phase 3: epochs over which λ ramps 0 → lambda-target")
+    parser.add_argument("--max-epochs",     type=int, default=200)
+    # DANN
     parser.add_argument("--lambda-target",  type=float, default=0.1,
-                        help="DANN weight at target (phase 3)")
-    parser.add_argument("--lambda-p2",      type=float, default=0.01,
-                        help="DANN weight during warmup (phase 2)")
+                        help="DANN weight at target")
     # Optimisation
     parser.add_argument("--lr",             type=float, default=1e-4)
     parser.add_argument("--batch-size",     type=int,   default=BATCH_SIZE)
     parser.add_argument("--patience",       type=int,   default=30,
-                        help="Early stopping patience, counted from end of phase 1")
+                        help="Early stopping patience, counted from start of phase 3")
     parser.add_argument("--log-every",      type=int,   default=5)
     args = parser.parse_args()
 
@@ -244,8 +234,23 @@ def main():
     run_type, run_dir = parse_run(args.run)
     is_dry     = run_type == "dry"
     n_sims     = N_SIMS_DRY if is_dry else (args.n_sims or N_SIMS_FULL)
-    phase1_end = args.phase1_epochs
-    phase2_end = args.phase1_epochs + args.phase2_epochs
+
+    # Phase boundary epochs (cumulative)
+    flow_end = args.flow_warmup
+    enc_end  = flow_end + args.enc_warmup
+    sim_end  = enc_end  + args.joint_sim
+
+    def get_phase(epoch: int) -> int:
+        if epoch <= flow_end: return 0
+        if epoch <= enc_end:  return 1
+        if epoch <= sim_end:  return 2
+        return 3
+
+    def get_lambda(epoch: int) -> float:
+        if epoch <= sim_end:
+            return 0.0
+        t = min(1.0, (epoch - sim_end) / max(1, args.lambda_warmup))
+        return args.lambda_target * t
 
     if args.hidden_features is None:
         args.hidden_features = 256 if "nsf" in args.objective else 128
@@ -265,8 +270,9 @@ def main():
 
     log(f"Run: {args.run}  v={args.version}  ({'dry' if is_dry else 'full'})")
     log(f"Objective: {args.objective}  Device: {DEVICE}")
-    log(f"Phase schedule — p1_end={phase1_end}  p2_end={phase2_end}  max={args.max_epochs}")
-    log(f"λ_p2={args.lambda_p2}  λ_target={args.lambda_target}")
+    log(f"Phase boundaries — flow_end={flow_end}  enc_end={enc_end}  "
+        f"sim_end={sim_end}  max={args.max_epochs}")
+    log(f"λ ramps 0→{args.lambda_target} over {args.lambda_warmup} epochs starting ep {sim_end+1}")
 
     # ── Load data ──────────────────────────────────────────────────────────────
     stats    = load_stats(STATS_PATH)
@@ -307,11 +313,14 @@ def main():
     domain_clf = DomainClassifier(latent_dim=args.latent_dim, hidden=256).to(DEVICE)
     log(f"Domain classifier: {domain_clf.describe()}")
 
-    # ── Optimizer ──────────────────────────────────────────────────────────────
+    # ── Separate optimizers ────────────────────────────────────────────────────
+    enc_opt    = torch.optim.Adam(encoder.parameters(),    lr=args.lr)
+    flow_opt   = torch.optim.Adam(task_head.parameters(),  lr=args.lr)
+    domain_opt = torch.optim.Adam(domain_clf.parameters(), lr=args.lr)
+
     all_params = (list(encoder.parameters())
                   + list(task_head.parameters())
                   + list(domain_clf.parameters()))
-    opt = torch.optim.Adam(all_params, lr=args.lr)
     log(f"Adam  lr={args.lr}  total_params={sum(p.numel() for p in all_params):,}")
 
     # ── Write run_info ─────────────────────────────────────────────────────────
@@ -337,10 +346,8 @@ def main():
             real_data=args.real_data,
         ),
         schedule=dict(
-            phase1_end=phase1_end,
-            phase2_end=phase2_end,
-            max_epochs=args.max_epochs,
-            lambda_p2=args.lambda_p2,
+            flow_end=flow_end, enc_end=enc_end, sim_end=sim_end,
+            lambda_warmup=args.lambda_warmup, max_epochs=args.max_epochs,
             lambda_target=args.lambda_target,
         ),
         training=dict(lr=args.lr, batch_size=args.batch_size, patience=args.patience),
@@ -363,9 +370,8 @@ def main():
 
     log("Training...")
     for epoch in range(1, args.max_epochs + 1):
-        lambda_e   = get_lambda(epoch, phase1_end, phase2_end, args.lambda_p2, args.lambda_target)
-        use_domain = lambda_e > 0.0
-        phase      = 1 if epoch <= phase1_end else (2 if epoch <= phase2_end else 3)
+        phase    = get_phase(epoch)
+        lambda_e = get_lambda(epoch)
 
         encoder.train(); task_head.train(); domain_clf.train()
 
@@ -386,13 +392,13 @@ def main():
             else:
                 task_loss = F.mse_loss(task_head(z_sim), x_sim_b[:, :WAVE_LEN])
 
-            # ── Domain loss (λ > 0) ───────────────────────────────────────────
-            if use_domain:
-                real_idx = torch.randint(0, len(real_beats), (len(idx),), device=DEVICE)
-                x_real_b = real_beats[real_idx].to(DEVICE)
-                z_real   = encoder(x_real_b)
-                logits   = torch.cat([domain_clf(grl(z_sim)), domain_clf(grl(z_real))])
-                labels   = torch.cat([
+            # ── Domain loss (phase 3 only) ────────────────────────────────────
+            if phase == 3:
+                real_idx    = torch.randint(0, len(real_beats), (len(idx),), device=DEVICE)
+                x_real_b    = real_beats[real_idx].to(DEVICE)
+                z_real      = encoder(x_real_b)
+                logits      = torch.cat([domain_clf(grl(z_sim)), domain_clf(grl(z_real))])
+                labels      = torch.cat([
                     torch.zeros(len(z_sim),  device=DEVICE),
                     torch.ones(len(z_real), device=DEVICE),
                 ])
@@ -402,10 +408,23 @@ def main():
 
             total = task_loss + lambda_e * domain_loss
 
-            opt.zero_grad()
+            enc_opt.zero_grad(); flow_opt.zero_grad(); domain_opt.zero_grad()
             total.backward()
-            torch.nn.utils.clip_grad_norm_(all_params, 1.0)
-            opt.step()
+
+            # Step only the active components per phase
+            if phase == 0:
+                torch.nn.utils.clip_grad_norm_(task_head.parameters(), 1.0)
+                flow_opt.step()
+            elif phase == 1:
+                torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
+                enc_opt.step()
+            elif phase == 2:
+                torch.nn.utils.clip_grad_norm_(
+                    list(encoder.parameters()) + list(task_head.parameters()), 1.0)
+                enc_opt.step(); flow_opt.step()
+            else:  # phase 3
+                torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+                enc_opt.step(); flow_opt.step(); domain_opt.step()
 
             ep_task += task_loss.item()
             ep_dom  += domain_loss.item()
@@ -421,21 +440,23 @@ def main():
                              f"{lambda_e:.4f}", phase])
         csv_fh.flush()
 
-        if avg_tot < best_loss:
+        # Track best state from phase 2 onward (comparable total loss)
+        if phase >= 2 and avg_tot < best_loss:
             best_loss    = avg_tot
             best_enc_sd  = {k: v.clone() for k, v in encoder.state_dict().items()}
             best_task_sd = {k: v.clone() for k, v in task_head.state_dict().items()}
             wait = 0
-        else:
+        elif phase >= 2:
             wait += 1
 
         if epoch % args.log_every == 0 or epoch == 1:
-            log(f"  ep {epoch:4d}/{args.max_epochs}  ph={phase}"
+            phase_name = ["flow-warmup", "enc-warmup", "joint-sim", "joint-dann"][phase]
+            log(f"  ep {epoch:4d}/{args.max_epochs}  [{phase_name}]"
                 f"  task={avg_task:.4f}  dom={avg_dom:.4f}"
                 f"  total={avg_tot:.4f}  λ={lambda_e:.3f}  wait={wait}")
 
-        # Only apply patience after phase 1 — total isn't comparable across phases
-        if epoch > phase1_end and wait >= args.patience:
+        # Early stopping only in phase 3
+        if phase == 3 and wait >= args.patience:
             log(f"Early stop at epoch {epoch}  best_total={best_loss:.4f}")
             break
 
