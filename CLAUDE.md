@@ -69,6 +69,9 @@ Goal: joint training of encoder + DANN + inference objective (train_joint.py).
 
 Experiments 1 & 2 use `train_joint.py` (Lipschitz encoder, built). VAE encoder not yet implemented.
 
+### Planned for v2
+- **Real data augmentation (Mixup)**: replace random-with-replacement sampling of 802 real beats with on-the-fly Mixup. Per batch, draw `batch_size` random pairs `(i, j)` from real beats, interpolate `x = λ·x_i + (1-λ)·x_j` with `λ ~ Beta(0.4, 0.4)`, add small Gaussian noise (σ_wave≈0.03, σ_scalar≈0.01). This expands effective real diversity from 802 fixed vectors to ~321k unique pairs per epoch with fresh lambdas. Deferred from v1 — domain loss is lightly weighted (λ=0.1) so overfitting risk is acceptable.
+
 ## Git conventions
 
 - Never add `Co-Authored-By: Claude` or any AI authorship trailer to commit messages.
