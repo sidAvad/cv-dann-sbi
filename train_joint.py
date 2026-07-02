@@ -394,7 +394,7 @@ def main():
 
             # ── Domain loss (phase 3 only) ────────────────────────────────────
             if phase == 3:
-                real_idx    = torch.randint(0, len(real_beats), (len(idx),), device=DEVICE)
+                real_idx    = torch.randint(0, len(real_beats), (len(idx),))
                 x_real_b    = real_beats[real_idx].to(DEVICE)
                 z_real      = encoder(x_real_b)
                 logits      = torch.cat([domain_clf(grl(z_sim)), domain_clf(grl(z_real))])
