@@ -33,19 +33,20 @@ Forked from `cv-inverse-autoencoder` (the surrogate training repo).
 
 ## Run naming convention
 
-Joint training runs: `{type}-v{version}_{encoder-type}_{objective}`
+Joint training runs: `{type}-v{version}_{encoder-type}_dann_{objective}`
 
 - `type`: `exp` (full run) or `dry` (512 sims, smoke test)
-- `v{version}`: version string — use integers for major variants (`v1`, `v2`), decimals for minor tweaks (`v1.1`, `v1.2`); stored verbatim in `run_info.json` as `"version": "1.1"`
+- `v{version}`: version string — use integers for major variants (`v1`, `v2`), decimals for minor tweaks (`v1.1`, `v1.2`); stored verbatim in `run_info_v{version}.json` as `"version": "1.1"`
 - `encoder-type`: `encoder-lipschitz` or `encoder-vae`
+- `dann`: always present — all train_joint.py runs use domain adversarial training
 - `objective`: `flow-maf5`, `flow-nsf8`, or `reconstruction`
 
 Examples:
-- `exp-v1_encoder-lipschitz_flow-maf5`
-- `exp-v1.1_encoder-lipschitz_flow-maf5`
-- `exp-v1_encoder-lipschitz_reconstruction`
-- `exp-v1_encoder-vae_flow-maf5`
-- `dry-v1_encoder-lipschitz_flow-maf5`
+- `exp-v1_encoder-lipschitz_dann_flow-maf5`
+- `exp-v1.1_encoder-lipschitz_dann_flow-maf5`
+- `exp-v1_encoder-lipschitz_dann_reconstruction`
+- `exp-v1_encoder-vae_dann_flow-maf5`
+- `dry-v1_encoder-lipschitz_dann_flow-maf5`
 
 ## Experiment tracking
 
@@ -61,10 +62,10 @@ Goal: joint training of encoder + DANN + inference objective (train_joint.py).
 
 | # | Encoder | Objective | Run name | Status |
 |---|---------|-----------|----------|--------|
-| 1 | lipschitz | flow-maf5 | `exp-v1_encoder-lipschitz_flow-maf5` | next |
-| 2 | lipschitz | reconstruction | `exp-v1_encoder-lipschitz_reconstruction` | after 1 |
-| 3 | vae | flow-maf5 | `exp-v1_encoder-vae_flow-maf5` | future |
-| 4 | vae | reconstruction | `exp-v1_encoder-vae_reconstruction` | future |
+| 1 | lipschitz | flow-maf5 | `exp-v1_encoder-lipschitz_dann_flow-maf5` | next |
+| 2 | lipschitz | reconstruction | `exp-v1_encoder-lipschitz_dann_reconstruction` | after 1 |
+| 3 | vae | flow-maf5 | `exp-v1_encoder-vae_dann_flow-maf5` | future |
+| 4 | vae | reconstruction | `exp-v1_encoder-vae_dann_reconstruction` | future |
 
 Experiments 1 & 2 use `train_joint.py` (Lipschitz encoder, built). VAE encoder not yet implemented.
 
