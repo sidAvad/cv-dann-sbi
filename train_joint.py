@@ -388,7 +388,7 @@ def main():
 
             # ── Task loss ─────────────────────────────────────────────────────
             if is_flow:
-                task_loss = -task_head.log_prob(theta_b, context=z_sim).mean()
+                task_loss = -task_head.log_prob(theta_b, condition=z_sim).mean()
             else:
                 task_loss = F.mse_loss(task_head(z_sim), x_sim_b[:, :WAVE_LEN])
 
