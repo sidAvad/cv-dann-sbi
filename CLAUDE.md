@@ -62,15 +62,44 @@ Goal: joint training of encoder + DANN + inference objective (train_joint.py).
 
 | # | Encoder | Objective | Run name | Status |
 |---|---------|-----------|----------|--------|
-| 1 | lipschitz | flow-maf5 | `exp-v1_encoder-lipschitz_dann_flow-maf5` | next |
-| 2 | lipschitz | reconstruction | `exp-v1_encoder-lipschitz_dann_reconstruction` | after 1 |
-| 3 | vae | flow-maf5 | `exp-v1_encoder-vae_dann_flow-maf5` | future |
-| 4 | vae | reconstruction | `exp-v1_encoder-vae_dann_reconstruction` | future |
+| 1 | lipschitz | flow-maf5 | `exp-v1_encoder-lipschitz_dann_flow-maf5` | done — task=30.24, dom=0.0014 |
+| 1.1 | lipschitz (128-dim) | flow-maf5 | `exp-v1.1_encoder-lipschitz_dann_flow-maf5` | done — task=28.22, dom=0.0003 |
+| 1.3 | lipschitz (64-dim, λ=0.5) | flow-maf5 | `exp-v1.3_encoder-lipschitz_dann_flow-maf5` | done — task=29.43, dom=0.0002 |
+| 2 | lipschitz | WDGRL + flow-maf5 | `exp-v2_encoder-lipschitz_dann_flow-maf5` | next |
 
-Experiments 1 & 2 use `train_joint.py` (Lipschitz encoder, built). VAE encoder not yet implemented.
+**v1 finding**: BCE domain loss saturates near 0 across all λ settings (equilibrium should be 0.693). Classifier trivially separates sim/real — DANN gradient to encoder is near-zero. 128-dim latent helps flow quality regardless.
 
-### Planned for v2
-- **Real data augmentation (Mixup)**: replace random-with-replacement sampling of 802 real beats with on-the-fly Mixup. Per batch, draw `batch_size` random pairs `(i, j)` from real beats, interpolate `x = λ·x_i + (1-λ)·x_j` with `λ ~ Beta(0.4, 0.4)`, add small Gaussian noise (σ_wave≈0.03, σ_scalar≈0.01). This expands effective real diversity from 802 fixed vectors to ~321k unique pairs per epoch with fresh lambdas. Deferred from v1 — domain loss is lightly weighted (λ=0.1) so overfitting risk is acceptable.
+### v2 plan: WDGRL (Wasserstein critic replaces BCE domain head)
+
+Full spec in chat history (2026-07-02). Key changes to `train_joint.py` and `models.py`:
+
+**Normalization**: verify sim stats applied identically to real (already done in `load_real_beats()`). Log `mean/std` of `x_all` vs `real_beats` at startup to confirm.
+
+**`WassersteinCritic`** (add to `models.py`): small MLP (128→128→128→1), LeakyReLU(0.2), no sigmoid. Estimates W1 via Kantorovich-Rubinstein duality. Keep small (hidden=128) to avoid memorising 802 real beats.
+
+**Gradient penalty** (add to `train_joint.py`): `gp = ((||∇_ẑ f(ẑ)||₂ - 1)²).mean()` at interpolates `ẑ = ε·z_sim + (1-ε)·z_real`. `create_graph=True` is critical — without it, GP contributes no gradient and critic stops being Lipschitz.
+
+**Critic update loop** (`n_critic=5` per encoder step):
+- Critic inner loop: `z = encoder(x).detach()` — no encoder gradient
+- `L_critic = -(E_sim[f(z)] - E_real[f(z)]) + gp_weight * gp`  (`gp_weight=10`)
+- Critic Adam: `β1=0.5` (WGAN-GP convention)
+- Encoder step: `total = task_loss + λ * (E_sim[f(z_sim)] - E_real[f(z_real)])` — encoder minimizes W1
+
+**Schedule**:
+- Phase 0 (flow warmup): unchanged
+- Phase 1 (enc warmup): BEGIN WDGRL at `--lambda-enc-warmup` (default 0.01)
+- Phase 2 (joint sim): unchanged, no domain loss
+- Phase 3 (joint+domain): ramp λ linearly or sigmoid `2/(1+e^{-γp})-1` to `--lambda-target`
+
+**New CLI args**: `--n-critic 5`, `--gp-weight 10`, `--critic-hidden 128`, `--lambda-enc-warmup 0.01`, `--lambda-schedule [linear|sigmoid]`, `--lambda-gamma 10`
+
+**New CSV columns**: `w1_est`, `gp` (in addition to existing task/total/lambda/phase)
+
+**Deferred from v2**: Mixup augmentation (see below), reconstruction objective, VAE encoder.
+
+### Other planned improvements
+- **Real data augmentation (Mixup)**: on-the-fly Mixup of 802 real beats. Per batch draw `batch_size` pairs `(i,j)`, interpolate `x = λ·x_i + (1-λ)·x_j` with `λ ~ Beta(0.4, 0.4)`, add Gaussian noise (σ_wave≈0.03, σ_scalar≈0.01). Expands diversity from 802 fixed vectors to ~321k unique pairs per epoch. Pair with v2 WDGRL.
+- **Sim data on mithril**: copy 10 HDF5 files (≈7.5 GB) covering 100k sims from pulsar to `/media/local/` on mithril for faster loading.
 
 ## Git conventions
 
