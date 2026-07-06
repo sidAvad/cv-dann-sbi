@@ -109,6 +109,14 @@ def parse_run(name: str):
         raise ValueError("--run must start with 'exp-' or 'dry-'")
 
 
+def mixup_real(real_beats: torch.Tensor, n: int, alpha: float, device: str) -> torch.Tensor:
+    """On-the-fly Mixup of real beats. Returns n interpolated samples."""
+    idx_i = torch.randint(0, len(real_beats), (n,), device=device)
+    idx_j = torch.randint(0, len(real_beats), (n,), device=device)
+    lam   = torch.distributions.Beta(alpha, alpha).sample((n,)).to(device).unsqueeze(1)
+    return lam * real_beats[idx_i] + (1 - lam) * real_beats[idx_j]
+
+
 def gradient_penalty(critic: nn.Module, z_sim: torch.Tensor,
                      z_real: torch.Tensor, device: str) -> torch.Tensor:
     """1-Lipschitz gradient penalty for WGAN-GP at random interpolates.
@@ -238,6 +246,10 @@ def main():
                         help="λ ramp schedule in phase 2")
     parser.add_argument("--lambda-gamma",      type=float, default=10.0,
                         help="Sigmoid schedule steepness")
+    parser.add_argument("--use-mixup",          action="store_true",
+                        help="Augment real beats with on-the-fly Mixup (Beta interpolation)")
+    parser.add_argument("--mixup-alpha",        type=float, default=0.4,
+                        help="Beta distribution concentration for Mixup")
     parser.add_argument("--n-critic",          type=int,   default=5,
                         help="Critic updates per encoder step")
     parser.add_argument("--gp-weight",         type=float, default=10.0,
@@ -298,6 +310,7 @@ def main():
         f"warmup_epochs={args.lambda_warmup}")
     log(f"WDGRL: n_critic={args.n_critic}  gp_weight={args.gp_weight}  "
         f"critic_hidden={args.critic_hidden}")
+    log(f"Mixup: {'on' if args.use_mixup else 'off'}  alpha={args.mixup_alpha}")
 
     # ── Load data ──────────────────────────────────────────────────────────────
     stats    = load_stats(STATS_PATH)
@@ -386,6 +399,8 @@ def main():
             n_critic=args.n_critic,
             gp_weight=args.gp_weight,
             critic_hidden=args.critic_hidden,
+            use_mixup=args.use_mixup,
+            mixup_alpha=args.mixup_alpha,
         ),
         training=dict(lr=args.lr, batch_size=args.batch_size, patience=args.patience),
     )
@@ -422,13 +437,18 @@ def main():
             x_sim_b = x_all[idx].to(DEVICE)
             theta_b = theta_all[idx].to(DEVICE)
 
-            # ── Critic inner loop (phases 1 & 2) ──────────────────────────────
+            def sample_real(n):
+                if args.use_mixup:
+                    return mixup_real(real_beats, n, args.mixup_alpha, DEVICE)
+                idx = torch.randint(0, len(real_beats), (n,), device=DEVICE)
+                return real_beats[idx]
+
+            # ── Critic inner loop (phase 2 only) ──────────────────────────────
             batch_gp = 0.0
             if use_wdgrl:
                 for _ in range(args.n_critic):
                     z_sim_d  = encoder(x_sim_b).detach()
-                    real_idx = torch.randint(0, len(real_beats), (len(idx),), device=DEVICE)
-                    z_real_d = encoder(real_beats[real_idx]).detach()
+                    z_real_d = encoder(sample_real(len(idx))).detach()
                     gp       = gradient_penalty(critic, z_sim_d, z_real_d, DEVICE)
                     w_diff   = critic(z_sim_d).mean() - critic(z_real_d).mean()
                     c_loss   = -w_diff + args.gp_weight * gp
@@ -447,8 +467,7 @@ def main():
                 task_loss = F.mse_loss(task_head(z_sim), x_sim_b[:, :WAVE_LEN])
 
             if use_wdgrl:
-                real_idx    = torch.randint(0, len(real_beats), (len(idx),), device=DEVICE)
-                z_real      = encoder(real_beats[real_idx])
+                z_real = encoder(sample_real(len(idx)))
                 w1_est      = critic(z_sim).mean() - critic(z_real).mean()
                 domain_loss = w1_est
             else:
