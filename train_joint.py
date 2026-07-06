@@ -1,22 +1,22 @@
 """
 Joint training: LipschitzReducedAutoencoderEncoder + WDGRL + task head.
 
-Four-phase training schedule:
+Three-phase training schedule:
 
   Phase 0  flow-warmup    encoder frozen, flow trains                      (sim only)
   Phase 1  enc-warmup     flow frozen, encoder trains + WDGRL at λ_warm    (sim + real)
-  Phase 2  joint-sim      encoder + flow jointly, no domain loss            (sim only)
-  Phase 3  joint-wdgrl    encoder + flow + WDGRL, λ ramps to target         (sim + real)
+  Phase 2  joint          encoder + flow + WDGRL, λ ramps to target         (sim + real)
 
 WDGRL: Wasserstein critic (MLP, no sigmoid) trained with WGAN-GP.
   - n_critic inner critic updates per encoder step, encoder detached during critic updates
   - Gradient penalty at random interpolates enforces 1-Lipschitz on critic
   - Encoder step minimizes W1 estimate (critic(z_sim).mean() - critic(z_real).mean())
+  - Real data has no theta labels; it only contributes domain gradient to the encoder
 
 Separate Adam optimizers for encoder, flow, and critic.
 Critic Adam uses betas=(0.5, 0.9) per WGAN-GP convention.
-λ ramps linearly or sigmoid from 0 → --lambda-target over --lambda-warmup epochs in phase 3.
-Early stopping on total loss, patience counted from the start of phase 3.
+λ ramps linearly or sigmoid from 0 → --lambda-target over --lambda-warmup epochs in phase 2.
+Early stopping on total loss, patience counted from the start of phase 2.
 
 Run names: exp-v{N}_encoder-lipschitz_dann_{flow-maf5|flow-nsf8|reconstruction}
 run_info:  outputs/{run}/run_info_v{version}.json
@@ -225,13 +225,11 @@ def main():
                         help="Default: 5 for MAF, 8 for NSF")
     # Phase schedule (cumulative epoch counts)
     parser.add_argument("--flow-warmup",   type=int, default=2,
-                        help="Phase 0: epochs training flow only")
+                        help="Phase 0: epochs training flow only (encoder frozen)")
     parser.add_argument("--enc-warmup",    type=int, default=10,
-                        help="Phase 1: epochs training encoder only + WDGRL")
-    parser.add_argument("--joint-sim",     type=int, default=20,
-                        help="Phase 2: joint sim epochs before WDGRL reintroduced")
+                        help="Phase 1: epochs training encoder only + WDGRL (flow frozen)")
     parser.add_argument("--lambda-warmup", type=int, default=20,
-                        help="Phase 3: epochs over which λ ramps 0→lambda-target")
+                        help="Phase 2: epochs over which λ ramps 0→lambda-target")
     parser.add_argument("--max-epochs",    type=int, default=200)
     # WDGRL
     parser.add_argument("--lambda-target",     type=float, default=0.1,
@@ -239,7 +237,7 @@ def main():
     parser.add_argument("--lambda-enc-warmup", type=float, default=0.01,
                         help="WDGRL weight during encoder warmup phase (phase 1)")
     parser.add_argument("--lambda-schedule",   choices=["linear", "sigmoid"], default="linear",
-                        help="λ ramp schedule in phase 3")
+                        help="λ ramp schedule in phase 2")
     parser.add_argument("--lambda-gamma",      type=float, default=10.0,
                         help="Sigmoid schedule steepness")
     parser.add_argument("--n-critic",          type=int,   default=5,
@@ -252,7 +250,7 @@ def main():
     parser.add_argument("--lr",         type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int,   default=BATCH_SIZE)
     parser.add_argument("--patience",   type=int,   default=30,
-                        help="Early stopping patience from start of phase 3")
+                        help="Early stopping patience from start of phase 2")
     parser.add_argument("--log-every",  type=int,   default=5)
     args = parser.parse_args()
 
@@ -264,21 +262,19 @@ def main():
     # Phase boundary epochs (cumulative)
     flow_end = args.flow_warmup
     enc_end  = flow_end + args.enc_warmup
-    sim_end  = enc_end  + args.joint_sim
 
     def get_phase(epoch: int) -> int:
         if epoch <= flow_end: return 0
         if epoch <= enc_end:  return 1
-        if epoch <= sim_end:  return 2
-        return 3
+        return 2
 
     def get_lambda(epoch: int) -> float:
         phase = get_phase(epoch)
         if phase == 1:
             return args.lambda_enc_warmup
-        if phase != 3:
+        if phase != 2:
             return 0.0
-        t = min(1.0, (epoch - sim_end) / max(1, args.lambda_warmup))
+        t = min(1.0, (epoch - enc_end) / max(1, args.lambda_warmup))
         if args.lambda_schedule == "linear":
             return args.lambda_target * t
         # sigmoid: 2/(1+e^{-γt})-1, reaches ~lambda_target at t=1 with γ=10
@@ -302,8 +298,7 @@ def main():
 
     log(f"Run: {args.run}  v={args.version}  ({'dry' if is_dry else 'full'})")
     log(f"Objective: {args.objective}  Device: {DEVICE}")
-    log(f"Phase boundaries — flow_end={flow_end}  enc_end={enc_end}  "
-        f"sim_end={sim_end}  max={args.max_epochs}")
+    log(f"Phase boundaries — flow_end={flow_end}  enc_end={enc_end}  max={args.max_epochs}")
     log(f"λ: enc_warmup={args.lambda_enc_warmup}  target={args.lambda_target}  "
         f"schedule={args.lambda_schedule}  warmup_epochs={args.lambda_warmup}")
     log(f"WDGRL: n_critic={args.n_critic}  gp_weight={args.gp_weight}  "
@@ -387,7 +382,7 @@ def main():
             real_data=args.real_data,
         ),
         schedule=dict(
-            flow_end=flow_end, enc_end=enc_end, sim_end=sim_end,
+            flow_end=flow_end, enc_end=enc_end,
             lambda_warmup=args.lambda_warmup, max_epochs=args.max_epochs,
             lambda_target=args.lambda_target,
             lambda_enc_warmup=args.lambda_enc_warmup,
@@ -420,7 +415,7 @@ def main():
     for epoch in range(1, args.max_epochs + 1):
         phase     = get_phase(epoch)
         lambda_e  = get_lambda(epoch)
-        use_wdgrl = (phase == 1 or phase == 3)
+        use_wdgrl = (phase >= 1)
 
         encoder.train(); task_head.train(); critic.train()
 
@@ -433,7 +428,7 @@ def main():
             x_sim_b = x_all[idx].to(DEVICE)
             theta_b = theta_all[idx].to(DEVICE)
 
-            # ── Critic inner loop (phases 1 & 3) ──────────────────────────────
+            # ── Critic inner loop (phases 1 & 2) ──────────────────────────────
             batch_gp = 0.0
             if use_wdgrl:
                 for _ in range(args.n_critic):
@@ -477,10 +472,7 @@ def main():
             elif phase == 1:
                 torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
                 enc_opt.step()
-            elif phase == 2:
-                torch.nn.utils.clip_grad_norm_(enc_flow_params, 1.0)
-                enc_opt.step(); flow_opt.step()
-            else:  # phase 3
+            else:  # phase 2: joint
                 torch.nn.utils.clip_grad_norm_(enc_flow_params, 1.0)
                 enc_opt.step(); flow_opt.step()
 
@@ -500,21 +492,21 @@ def main():
                              f"{avg_tot:.5f}", f"{lambda_e:.4f}", phase])
         csv_fh.flush()
 
-        if phase >= 2 and avg_tot < best_loss:
+        if phase == 2 and avg_tot < best_loss:
             best_loss    = avg_tot
             best_enc_sd  = {k: v.clone() for k, v in encoder.state_dict().items()}
             best_task_sd = {k: v.clone() for k, v in task_head.state_dict().items()}
             wait = 0
-        elif phase >= 2:
+        elif phase == 2:
             wait += 1
 
         if epoch % args.log_every == 0 or epoch == 1:
-            phase_name = ["flow-warmup", "enc-warmup", "joint-sim", "joint-wdgrl"][phase]
+            phase_name = ["flow-warmup", "enc-warmup", "joint"][phase]
             log(f"  ep {epoch:4d}/{args.max_epochs}  [{phase_name}]"
                 f"  task={avg_task:.4f}  w1={avg_w1:.4f}  gp={avg_gp:.4f}"
                 f"  total={avg_tot:.4f}  λ={lambda_e:.3f}  wait={wait}")
 
-        if phase == 3 and wait >= args.patience:
+        if phase == 2 and wait >= args.patience:
             log(f"Early stop at epoch {epoch}  best_total={best_loss:.4f}")
             break
 
