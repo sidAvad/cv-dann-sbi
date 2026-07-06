@@ -15,12 +15,25 @@
 
 ## Next runs
 
-| # | Change | Run name |
-|---|--------|----------|
-| 2.1 | extend to 400 epochs | `exp-v2.1_encoder-lipschitz_dann_flow-maf5` |
-| 2.2 | higher λ (0.3–0.5) | `exp-v2.2_encoder-lipschitz_dann_flow-maf5` |
-| 2.3 | add Mixup on real beats | `exp-v2.3_encoder-lipschitz_dann_flow-maf5` |
-| 3 | VAE encoder + WDGRL | `exp-v3_encoder-vae_dann_flow-maf5` |
+### v2 series — hyperparameter search (100k sims, 802 reals, lipschitz encoder)
+Gate for v3: confirm adversarial tension (W1 and task diverge under higher λ) and lock in best λ + epoch count.
+
+| # | Change | Run name | Status |
+|---|--------|----------|--------|
+| 2.1 | 400 epochs | `exp-v2.1_encoder-lipschitz_dann_flow-maf5` | running (adamant GPU 1) |
+| 2.2 | higher λ (0.3–0.5) | `exp-v2.2_encoder-lipschitz_dann_flow-maf5` | pending |
+
+### v3 series — scale up (300k sims, reals augmented to ~300k via Mixup, best v2 hyperparams)
+Gate for v4: v3 confirms alignment at scale; Mixup note: interpolated reals add critic diversity but no new physiology.
+
+| # | Change | Run name | Status |
+|---|--------|----------|--------|
+| 3 | 300k sims + Mixup reals | `exp-v3_encoder-lipschitz_dann_flow-maf5` | pending |
+
+### v4 series — VAE encoder
+| # | Change | Run name | Status |
+|---|--------|----------|--------|
+| 4 | VAE encoder + WDGRL, best v3 hyperparams | `exp-v4_encoder-vae_dann_flow-maf5` | pending |
 
 ## WDGRL implementation notes (v2+)
 
