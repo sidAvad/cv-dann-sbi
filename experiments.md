@@ -20,8 +20,9 @@ Gate for v3: confirm adversarial tension (W1 and task diverge under higher λ) a
 
 | # | Change | Run name | Status |
 |---|--------|----------|--------|
-| 2.1 | 400 epochs | `exp-v2.1_encoder-lipschitz_dann_flow-maf5` | running (adamant GPU 1) |
-| 2.2 | higher λ (0.3–0.5) | `exp-v2.2_encoder-lipschitz_dann_flow-maf5` | pending |
+| 2.1 | 400 epochs, λ=0.1 | `exp-v2.1_encoder-lipschitz_dann_flow-maf5` | running (adamant GPU 1) |
+| 2.2 | λ=0.3, 60-ep ramp | `exp-v2.2_encoder-lipschitz_dann_flow-maf5` | running (adamant GPU 0) |
+| 2.3 | λ=0.5, 100-ep ramp | `exp-v2.3_encoder-lipschitz_dann_flow-maf5` | queued (GPU 1 when v2.1 done) |
 
 ### v3 series — scale up (300k sims, reals augmented to ~300k via Mixup, best v2 hyperparams)
 Gate for v4: v3 confirms alignment at scale; Mixup note: interpolated reals add critic diversity but no new physiology.
