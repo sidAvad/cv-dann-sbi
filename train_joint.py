@@ -1,28 +1,33 @@
 """
-Joint training: LipschitzReducedAutoencoderEncoder + DANN + task head.
+Joint training: LipschitzReducedAutoencoderEncoder + WDGRL + task head.
 
 Four-phase training schedule:
 
-  Phase 0  flow-warmup    encoder frozen, flow trains         (sim only)
-  Phase 1  enc-warmup     flow frozen, encoder trains         (sim only)
-  Phase 2  joint-sim      encoder + flow jointly, λ=0        (sim only)
-  Phase 3  joint-dann     encoder + flow + DANN, λ ramps up  (sim + real)
+  Phase 0  flow-warmup    encoder frozen, flow trains                      (sim only)
+  Phase 1  enc-warmup     flow frozen, encoder trains + WDGRL at λ_warm    (sim + real)
+  Phase 2  joint-sim      encoder + flow jointly, no domain loss            (sim only)
+  Phase 3  joint-wdgrl    encoder + flow + WDGRL, λ ramps to target         (sim + real)
 
-Separate Adam optimizers for encoder, flow, and domain classifier.
-Each optimizer steps only in phases where its component is active.
-λ ramps linearly 0 → --lambda over --lambda-warmup epochs at the start of phase 3.
+WDGRL: Wasserstein critic (MLP, no sigmoid) trained with WGAN-GP.
+  - n_critic inner critic updates per encoder step, encoder detached during critic updates
+  - Gradient penalty at random interpolates enforces 1-Lipschitz on critic
+  - Encoder step minimizes W1 estimate (critic(z_sim).mean() - critic(z_real).mean())
+
+Separate Adam optimizers for encoder, flow, and critic.
+Critic Adam uses betas=(0.5, 0.9) per WGAN-GP convention.
+λ ramps linearly or sigmoid from 0 → --lambda-target over --lambda-warmup epochs in phase 3.
 Early stopping on total loss, patience counted from the start of phase 3.
 
-Run names: exp-v{N}_encoder-lipschitz_{flow-maf5|flow-nsf8|reconstruction}
+Run names: exp-v{N}_encoder-lipschitz_dann_{flow-maf5|flow-nsf8|reconstruction}
 run_info:  outputs/{run}/run_info_v{version}.json
 
 Usage:
     python train_joint.py \\
-        --run exp-v1_encoder-lipschitz_flow-maf5 \\
-        --version 1 \\
+        --run exp-v2_encoder-lipschitz_dann_flow-maf5 \\
+        --version 2 \\
         --objective flow-maf5 \\
         --sim-data-root /media/local/SimData/hdf5/cv8/simset_10M_cv8Eed_20260314 \\
-        --real-data ~/real_data/multibeat
+        --real-data ~/real_data/onebeat_300patients
 """
 
 import argparse
@@ -53,8 +58,7 @@ from dataset import (
 from models import (
     LipschitzReducedAutoencoderEncoder,
     WaveformDecoder,
-    GradientReversalLayer,
-    DomainClassifier,
+    WassersteinCritic,
 )
 
 
@@ -103,6 +107,20 @@ def parse_run(name: str):
         return "exp", Path("outputs") / name
     else:
         raise ValueError("--run must start with 'exp-' or 'dry-'")
+
+
+def gradient_penalty(critic: nn.Module, z_sim: torch.Tensor,
+                     z_real: torch.Tensor, device: str) -> torch.Tensor:
+    """1-Lipschitz gradient penalty for WGAN-GP at random interpolates.
+
+    create_graph=True is critical — without it the GP has no gradient through
+    the critic and the Lipschitz constraint is not enforced.
+    """
+    eps   = torch.rand(z_sim.shape[0], 1, device=device)
+    z_hat = (eps * z_sim.detach() + (1 - eps) * z_real.detach()).requires_grad_(True)
+    f_hat = critic(z_hat)
+    grads = torch.autograd.grad(f_hat.sum(), z_hat, create_graph=True)[0]
+    return ((grads.norm(2, dim=1) - 1) ** 2).mean()
 
 
 # ─── Data loading ─────────────────────────────────────────────────────────────
@@ -167,11 +185,7 @@ def load_real_beats(data_dir: Path, stats: dict, log) -> torch.Tensor:
 
 def build_flow_net(objective: str, latent_dim: int, theta_stats: torch.Tensor,
                    hidden_features: int, num_transforms: int) -> nn.Module:
-    """Build MAF or NSF via sbi's posterior_nn with identity embedding.
-
-    The returned module exposes log_prob(theta, context=z) where z is our
-    latent. z_score stats for theta are fitted to theta_stats.
-    """
+    """Build MAF or NSF via sbi's posterior_nn with identity embedding."""
     model    = "maf" if "maf" in objective else "nsf"
     build_fn = posterior_nn(
         model=model,
@@ -190,10 +204,10 @@ def build_flow_net(objective: str, latent_dim: int, theta_stats: torch.Tensor,
 def main():
     parser = argparse.ArgumentParser()
     # Identity
-    parser.add_argument("--run",           required=True,
-                        help="e.g. exp-v1_encoder-lipschitz_flow-maf5")
-    parser.add_argument("--version",       required=True,
-                        help="Version string for run_info filename, e.g. '1' or '1.1'")
+    parser.add_argument("--run",     required=True,
+                        help="e.g. exp-v2_encoder-lipschitz_dann_flow-maf5")
+    parser.add_argument("--version", required=True,
+                        help="Version string for run_info filename, e.g. '2'")
     parser.add_argument("--objective",
                         choices=["flow-maf5", "flow-nsf8", "reconstruction"], required=True)
     # Data
@@ -201,7 +215,7 @@ def main():
     parser.add_argument("--real-data",     required=True)
     parser.add_argument("--n-sims",        type=int, default=None)
     # Encoder
-    parser.add_argument("--latent-dim",    type=int,   default=64)
+    parser.add_argument("--latent-dim",    type=int,   default=128)
     parser.add_argument("--sn-ceiling",    type=float, default=2.0)
     parser.add_argument("--proj-hidden",   type=int,   default=None)
     # Flow (ignored for reconstruction)
@@ -210,24 +224,36 @@ def main():
     parser.add_argument("--num-transforms",  type=int, default=None,
                         help="Default: 5 for MAF, 8 for NSF")
     # Phase schedule (cumulative epoch counts)
-    parser.add_argument("--flow-warmup",    type=int, default=2,
-                        help="Phase 0: epochs training flow only (encoder frozen)")
-    parser.add_argument("--enc-warmup",     type=int, default=10,
-                        help="Phase 1: epochs training encoder only (flow frozen)")
-    parser.add_argument("--joint-sim",      type=int, default=20,
-                        help="Phase 2: epochs of joint sim training before DANN is introduced")
-    parser.add_argument("--lambda-warmup",  type=int, default=20,
-                        help="Phase 3: epochs over which λ ramps 0 → lambda-target")
-    parser.add_argument("--max-epochs",     type=int, default=200)
-    # DANN
-    parser.add_argument("--lambda-target",  type=float, default=0.1,
-                        help="DANN weight at target")
+    parser.add_argument("--flow-warmup",   type=int, default=2,
+                        help="Phase 0: epochs training flow only")
+    parser.add_argument("--enc-warmup",    type=int, default=10,
+                        help="Phase 1: epochs training encoder only + WDGRL")
+    parser.add_argument("--joint-sim",     type=int, default=20,
+                        help="Phase 2: joint sim epochs before WDGRL reintroduced")
+    parser.add_argument("--lambda-warmup", type=int, default=20,
+                        help="Phase 3: epochs over which λ ramps 0→lambda-target")
+    parser.add_argument("--max-epochs",    type=int, default=200)
+    # WDGRL
+    parser.add_argument("--lambda-target",     type=float, default=0.1,
+                        help="WDGRL weight at full ramp")
+    parser.add_argument("--lambda-enc-warmup", type=float, default=0.01,
+                        help="WDGRL weight during encoder warmup phase (phase 1)")
+    parser.add_argument("--lambda-schedule",   choices=["linear", "sigmoid"], default="linear",
+                        help="λ ramp schedule in phase 3")
+    parser.add_argument("--lambda-gamma",      type=float, default=10.0,
+                        help="Sigmoid schedule steepness")
+    parser.add_argument("--n-critic",          type=int,   default=5,
+                        help="Critic updates per encoder step")
+    parser.add_argument("--gp-weight",         type=float, default=10.0,
+                        help="Gradient penalty coefficient")
+    parser.add_argument("--critic-hidden",     type=int,   default=128,
+                        help="Hidden dim for WassersteinCritic MLP")
     # Optimisation
-    parser.add_argument("--lr",             type=float, default=1e-4)
-    parser.add_argument("--batch-size",     type=int,   default=BATCH_SIZE)
-    parser.add_argument("--patience",       type=int,   default=30,
-                        help="Early stopping patience, counted from start of phase 3")
-    parser.add_argument("--log-every",      type=int,   default=5)
+    parser.add_argument("--lr",         type=float, default=1e-4)
+    parser.add_argument("--batch-size", type=int,   default=BATCH_SIZE)
+    parser.add_argument("--patience",   type=int,   default=30,
+                        help="Early stopping patience from start of phase 3")
+    parser.add_argument("--log-every",  type=int,   default=5)
     args = parser.parse_args()
 
     is_flow    = args.objective.startswith("flow")
@@ -247,10 +273,16 @@ def main():
         return 3
 
     def get_lambda(epoch: int) -> float:
-        if epoch <= sim_end:
+        phase = get_phase(epoch)
+        if phase == 1:
+            return args.lambda_enc_warmup
+        if phase != 3:
             return 0.0
         t = min(1.0, (epoch - sim_end) / max(1, args.lambda_warmup))
-        return args.lambda_target * t
+        if args.lambda_schedule == "linear":
+            return args.lambda_target * t
+        # sigmoid: 2/(1+e^{-γt})-1, reaches ~lambda_target at t=1 with γ=10
+        return args.lambda_target * (2 / (1 + np.exp(-args.lambda_gamma * t)) - 1)
 
     if args.hidden_features is None:
         args.hidden_features = 256 if "nsf" in args.objective else 128
@@ -272,7 +304,10 @@ def main():
     log(f"Objective: {args.objective}  Device: {DEVICE}")
     log(f"Phase boundaries — flow_end={flow_end}  enc_end={enc_end}  "
         f"sim_end={sim_end}  max={args.max_epochs}")
-    log(f"λ ramps 0→{args.lambda_target} over {args.lambda_warmup} epochs starting ep {sim_end+1}")
+    log(f"λ: enc_warmup={args.lambda_enc_warmup}  target={args.lambda_target}  "
+        f"schedule={args.lambda_schedule}  warmup_epochs={args.lambda_warmup}")
+    log(f"WDGRL: n_critic={args.n_critic}  gp_weight={args.gp_weight}  "
+        f"critic_hidden={args.critic_hidden}")
 
     # ── Load data ──────────────────────────────────────────────────────────────
     stats    = load_stats(STATS_PATH)
@@ -285,6 +320,14 @@ def main():
 
     log("Loading real patient beats...")
     real_beats = load_real_beats(Path(args.real_data), stats, log)
+
+    # ── Normalization sanity check ─────────────────────────────────────────────
+    log(f"x_all      mean={x_all.mean():.4f}  std={x_all.std():.4f}  "
+        f"shape={tuple(x_all.shape)}")
+    log(f"real_beats mean={real_beats.mean():.4f}  std={real_beats.std():.4f}  "
+        f"shape={tuple(real_beats.shape)}")
+
+    real_beats = real_beats.to(DEVICE)
 
     # ── Build models ───────────────────────────────────────────────────────────
     encoder = LipschitzReducedAutoencoderEncoder(
@@ -309,19 +352,17 @@ def main():
         ).to(DEVICE)
         log(f"Decoder: {task_head.describe()}")
 
-    grl        = GradientReversalLayer(alpha=1.0)
-    domain_clf = DomainClassifier(latent_dim=args.latent_dim, hidden=256).to(DEVICE)
-    log(f"Domain classifier: {domain_clf.describe()}")
+    critic = WassersteinCritic(latent_dim=args.latent_dim, hidden=args.critic_hidden).to(DEVICE)
+    log(f"WassersteinCritic: {critic.describe()}")
 
     # ── Separate optimizers ────────────────────────────────────────────────────
-    enc_opt    = torch.optim.Adam(encoder.parameters(),    lr=args.lr)
-    flow_opt   = torch.optim.Adam(task_head.parameters(),  lr=args.lr)
-    domain_opt = torch.optim.Adam(domain_clf.parameters(), lr=args.lr)
+    enc_opt    = torch.optim.Adam(encoder.parameters(),   lr=args.lr)
+    flow_opt   = torch.optim.Adam(task_head.parameters(), lr=args.lr)
+    critic_opt = torch.optim.Adam(critic.parameters(),    lr=args.lr, betas=(0.5, 0.9))
 
-    all_params = (list(encoder.parameters())
-                  + list(task_head.parameters())
-                  + list(domain_clf.parameters()))
-    log(f"Adam  lr={args.lr}  total_params={sum(p.numel() for p in all_params):,}")
+    enc_flow_params = list(encoder.parameters()) + list(task_head.parameters())
+    log(f"Adam lr={args.lr}  enc+flow params={sum(p.numel() for p in enc_flow_params):,}  "
+        f"critic params={sum(p.numel() for p in critic.parameters()):,}")
 
     # ── Write run_info ─────────────────────────────────────────────────────────
     run_info = dict(
@@ -338,7 +379,7 @@ def main():
             hidden_features=args.hidden_features if is_flow else None,
             num_transforms=args.num_transforms   if is_flow else None,
         ),
-        domain_clf=domain_clf.describe(),
+        wdgrl_critic=critic.describe(),
         data=dict(
             n_sims=n_sims,
             n_real_beats=len(real_beats),
@@ -349,6 +390,13 @@ def main():
             flow_end=flow_end, enc_end=enc_end, sim_end=sim_end,
             lambda_warmup=args.lambda_warmup, max_epochs=args.max_epochs,
             lambda_target=args.lambda_target,
+            lambda_enc_warmup=args.lambda_enc_warmup,
+            lambda_schedule=args.lambda_schedule,
+        ),
+        wdgrl=dict(
+            n_critic=args.n_critic,
+            gp_weight=args.gp_weight,
+            critic_hidden=args.critic_hidden,
         ),
         training=dict(lr=args.lr, batch_size=args.batch_size, patience=args.patience),
     )
@@ -366,17 +414,18 @@ def main():
     csv_path   = run_dir / f"train_log_{date_str}.csv"
     csv_fh     = open(csv_path, "w", newline="")
     csv_writer = csv.writer(csv_fh)
-    csv_writer.writerow(["epoch", "task", "domain", "total", "lambda", "phase"])
+    csv_writer.writerow(["epoch", "task", "w1_est", "gp", "total", "lambda", "phase"])
 
     log("Training...")
     for epoch in range(1, args.max_epochs + 1):
-        phase    = get_phase(epoch)
-        lambda_e = get_lambda(epoch)
+        phase     = get_phase(epoch)
+        lambda_e  = get_lambda(epoch)
+        use_wdgrl = (phase == 1 or phase == 3)
 
-        encoder.train(); task_head.train(); domain_clf.train()
+        encoder.train(); task_head.train(); critic.train()
 
         perm = torch.randperm(n_total)
-        ep_task = ep_dom = ep_tot = 0.0
+        ep_task = ep_w1 = ep_gp = ep_tot = 0.0
         n_batches = 0
 
         for start in range(0, n_total, args.batch_size):
@@ -384,34 +433,44 @@ def main():
             x_sim_b = x_all[idx].to(DEVICE)
             theta_b = theta_all[idx].to(DEVICE)
 
+            # ── Critic inner loop (phases 1 & 3) ──────────────────────────────
+            batch_gp = 0.0
+            if use_wdgrl:
+                for _ in range(args.n_critic):
+                    z_sim_d  = encoder(x_sim_b).detach()
+                    real_idx = torch.randint(0, len(real_beats), (len(idx),), device=DEVICE)
+                    z_real_d = encoder(real_beats[real_idx]).detach()
+                    gp       = gradient_penalty(critic, z_sim_d, z_real_d, DEVICE)
+                    w_diff   = critic(z_sim_d).mean() - critic(z_real_d).mean()
+                    c_loss   = -w_diff + args.gp_weight * gp
+                    critic_opt.zero_grad()
+                    c_loss.backward()
+                    critic_opt.step()
+                    batch_gp += gp.item()
+                batch_gp /= args.n_critic
+
+            # ── Encoder + flow step ───────────────────────────────────────────
             z_sim = encoder(x_sim_b)
 
-            # ── Task loss ─────────────────────────────────────────────────────
             if is_flow:
                 task_loss = -task_head.log_prob(theta_b, condition=z_sim).mean()
             else:
                 task_loss = F.mse_loss(task_head(z_sim), x_sim_b[:, :WAVE_LEN])
 
-            # ── Domain loss (phase 3 only) ────────────────────────────────────
-            if phase == 3:
-                real_idx    = torch.randint(0, len(real_beats), (len(idx),))
-                x_real_b    = real_beats[real_idx].to(DEVICE)
-                z_real      = encoder(x_real_b)
-                logits      = torch.cat([domain_clf(grl(z_sim)), domain_clf(grl(z_real))])
-                labels      = torch.cat([
-                    torch.zeros(len(z_sim),  device=DEVICE),
-                    torch.ones(len(z_real), device=DEVICE),
-                ])
-                domain_loss = F.binary_cross_entropy_with_logits(logits, labels)
+            if use_wdgrl:
+                real_idx    = torch.randint(0, len(real_beats), (len(idx),), device=DEVICE)
+                z_real      = encoder(real_beats[real_idx])
+                w1_est      = critic(z_sim).mean() - critic(z_real).mean()
+                domain_loss = w1_est
             else:
                 domain_loss = x_sim_b.new_zeros(1).squeeze()
+                w1_est      = domain_loss
 
             total = task_loss + lambda_e * domain_loss
 
-            enc_opt.zero_grad(); flow_opt.zero_grad(); domain_opt.zero_grad()
+            enc_opt.zero_grad(); flow_opt.zero_grad()
             total.backward()
 
-            # Step only the active components per phase
             if phase == 0:
                 torch.nn.utils.clip_grad_norm_(task_head.parameters(), 1.0)
                 flow_opt.step()
@@ -419,28 +478,28 @@ def main():
                 torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
                 enc_opt.step()
             elif phase == 2:
-                torch.nn.utils.clip_grad_norm_(
-                    list(encoder.parameters()) + list(task_head.parameters()), 1.0)
+                torch.nn.utils.clip_grad_norm_(enc_flow_params, 1.0)
                 enc_opt.step(); flow_opt.step()
             else:  # phase 3
-                torch.nn.utils.clip_grad_norm_(all_params, 1.0)
-                enc_opt.step(); flow_opt.step(); domain_opt.step()
+                torch.nn.utils.clip_grad_norm_(enc_flow_params, 1.0)
+                enc_opt.step(); flow_opt.step()
 
             ep_task += task_loss.item()
-            ep_dom  += domain_loss.item()
+            ep_w1   += w1_est.item()
+            ep_gp   += batch_gp
             ep_tot  += total.item()
             n_batches += 1
 
         avg_task = ep_task / n_batches
-        avg_dom  = ep_dom  / n_batches
+        avg_w1   = ep_w1   / n_batches
+        avg_gp   = ep_gp   / n_batches
         avg_tot  = ep_tot  / n_batches
 
         csv_writer.writerow([epoch,
-                             f"{avg_task:.5f}", f"{avg_dom:.5f}", f"{avg_tot:.5f}",
-                             f"{lambda_e:.4f}", phase])
+                             f"{avg_task:.5f}", f"{avg_w1:.5f}", f"{avg_gp:.5f}",
+                             f"{avg_tot:.5f}", f"{lambda_e:.4f}", phase])
         csv_fh.flush()
 
-        # Track best state from phase 2 onward (comparable total loss)
         if phase >= 2 and avg_tot < best_loss:
             best_loss    = avg_tot
             best_enc_sd  = {k: v.clone() for k, v in encoder.state_dict().items()}
@@ -450,12 +509,11 @@ def main():
             wait += 1
 
         if epoch % args.log_every == 0 or epoch == 1:
-            phase_name = ["flow-warmup", "enc-warmup", "joint-sim", "joint-dann"][phase]
+            phase_name = ["flow-warmup", "enc-warmup", "joint-sim", "joint-wdgrl"][phase]
             log(f"  ep {epoch:4d}/{args.max_epochs}  [{phase_name}]"
-                f"  task={avg_task:.4f}  dom={avg_dom:.4f}"
+                f"  task={avg_task:.4f}  w1={avg_w1:.4f}  gp={avg_gp:.4f}"
                 f"  total={avg_tot:.4f}  λ={lambda_e:.3f}  wait={wait}")
 
-        # Early stopping only in phase 3
         if phase == 3 and wait >= args.patience:
             log(f"Early stop at epoch {epoch}  best_total={best_loss:.4f}")
             break
@@ -468,11 +526,11 @@ def main():
 
     torch.save(encoder.state_dict(), run_dir / "encoder.pt")
     if is_flow:
-        torch.save(task_head, run_dir / "flow_net.pt")   # full module: z-score stats live inside
+        torch.save(task_head, run_dir / "flow_net.pt")
     else:
         torch.save(task_head.state_dict(), run_dir / "decoder.pt")
-    torch.save(domain_clf.state_dict(), run_dir / "domain_clf.pt")
-    log(f"Saved encoder.pt  {'flow_net.pt' if is_flow else 'decoder.pt'}  domain_clf.pt")
+    torch.save(critic.state_dict(), run_dir / "wdgrl_critic.pt")
+    log(f"Saved encoder.pt  {'flow_net.pt' if is_flow else 'decoder.pt'}  wdgrl_critic.pt")
 
     log_fh.close()
     sys.stdout = _stdout

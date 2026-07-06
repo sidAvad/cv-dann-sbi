@@ -12,8 +12,9 @@ AE pre-training components:
   WaveformDecoder                   : latent_dim → MLP → out_channels*T, phases 1 + 2
 
 Joint training components (train_joint.py):
-  GradientReversalLayer : reverses gradient with scale alpha (DANN)
-  DomainClassifier      : MLP binary classifier, sim=0 / real=1; use after GRL
+  GradientReversalLayer : reverses gradient with scale alpha (DANN, kept for reference)
+  DomainClassifier      : MLP binary classifier, sim=0 / real=1 (DANN, kept for reference)
+  WassersteinCritic     : MLP W1 estimator for WDGRL (v2+)
 """
 
 import torch
@@ -460,6 +461,34 @@ class DomainClassifier(nn.Module):
     def describe(self):
         return {
             "type": "DomainClassifier",
+            "latent_dim": self.net[0].in_features,
+            "hidden": self.net[0].out_features,
+            "n_params": sum(p.numel() for p in self.parameters()),
+        }
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z).squeeze(-1)
+
+
+class WassersteinCritic(nn.Module):
+    """W1 estimator via Kantorovich-Rubinstein duality for WDGRL.
+
+    No sigmoid — outputs unbounded scalar per sample. Train with WGAN-GP loss:
+      L_critic = -(E_sim[f(z)] - E_real[f(z)]) + gp_weight * GP
+    Encoder minimizes E_sim[f(z)] - E_real[f(z)] (pushes distributions together).
+    """
+
+    def __init__(self, latent_dim: int, hidden: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, hidden), nn.LeakyReLU(0.2),
+            nn.Linear(hidden, hidden),     nn.LeakyReLU(0.2),
+            nn.Linear(hidden, 1),
+        )
+
+    def describe(self):
+        return {
+            "type": "WassersteinCritic",
             "latent_dim": self.net[0].in_features,
             "hidden": self.net[0].out_features,
             "n_params": sum(p.numel() for p in self.parameters()),
