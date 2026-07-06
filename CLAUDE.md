@@ -99,7 +99,12 @@ Full spec in chat history (2026-07-02). Key changes to `train_joint.py` and `mod
 
 ### Other planned improvements
 - **Real data augmentation (Mixup)**: on-the-fly Mixup of 802 real beats. Per batch draw `batch_size` pairs `(i,j)`, interpolate `x = λ·x_i + (1-λ)·x_j` with `λ ~ Beta(0.4, 0.4)`, add Gaussian noise (σ_wave≈0.03, σ_scalar≈0.01). Expands diversity from 802 fixed vectors to ~321k unique pairs per epoch. Pair with v2 WDGRL.
-- **Sim data on mithril**: copy 10 HDF5 files (≈7.5 GB) covering 100k sims from pulsar to `/media/local/` on mithril for faster loading.
+
+### Immediate infra next steps
+
+- **Output sync between mithril and adamant**: currently `outputs/` and `dry-runs/` are gitignored and excluded from Mutagen. Need a strategy to consolidate run artifacts (checkpoints, logs, CSVs) from mithril back to a central location (adamant or local). Options: (a) rsync outputs from mithril → adamant after each run; (b) add a separate one-way Mutagen session for outputs only; (c) use a shared NFS path on pulsar. Decide and set up before running multiple parallel experiments across machines.
+
+- **Sim data on mithril local storage**: current runs read from `/media/pulsar/` (slow network share). 100k sims = 10 HDF5 files ≈ 7.5 GB; mithril has 5.8 TB free on `/media/local/`. Decide: copy just the 10 files for 100k sims now, or copy a larger subset (e.g. 500k sims ≈ 37 GB) to leave room to scale up without re-copying. Also need `manifest_train.json` and `manifest_test.json`. Then update the default `--sim-data-root` path for mithril runs.
 
 ## Git conventions
 
