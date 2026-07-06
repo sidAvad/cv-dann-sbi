@@ -1,15 +1,28 @@
-# Plan
+# Experiments
 
-## Next experiments
+## Results
 
-| # | Change | Run name | Rationale |
-|---|--------|----------|-----------|
-| 2.1 | extend to 400 epochs | `exp-v2.1_encoder-lipschitz_dann_flow-maf5` | v2 hit 200 ep still improving (wait=2) |
-| 2.2 | higher λ (0.3–0.5) | `exp-v2.2_encoder-lipschitz_dann_flow-maf5` | W1 decreasing slowly at λ=0.1 |
-| 2.3 | add Mixup on real beats | `exp-v2.3_encoder-lipschitz_dann_flow-maf5` | more diversity for critic, reduce memorisation |
-| 3 | VAE encoder + WDGRL | `exp-v3_encoder-vae_dann_flow-maf5` | smooth/regularized latent |
+| # | Encoder | Objective | Run name | Result |
+|---|---------|-----------|----------|--------|
+| 1 | lipschitz (64-dim) | flow-maf5 | `exp-v1_encoder-lipschitz_dann_flow-maf5` | task=30.24, dom=0.0014 (BCE saturated) |
+| 1.1 | lipschitz (128-dim) | flow-maf5 | `exp-v1.1_encoder-lipschitz_dann_flow-maf5` | task=28.22, dom=0.0003 (BCE saturated) |
+| 1.3 | lipschitz (64-dim, λ=0.5) | flow-maf5 | `exp-v1.3_encoder-lipschitz_dann_flow-maf5` | task=29.43, dom=0.0002 (BCE saturated) |
+| 2 | lipschitz (128-dim) | WDGRL + flow-maf5 | `exp-v2_encoder-lipschitz_dann_flow-maf5` | task=28.95, w1=2.0↓ (hit 200 ep, still improving) |
 
-## WDGRL implementation (v2, implemented)
+**v1 finding**: BCE saturates to ~0 regardless of λ; encoder gets near-zero domain gradient. 128-dim latent improves flow quality independently.
+
+**v2 finding**: WDGRL working — W1 non-trivial and slowly decreasing (2.47→1.98 over 200 ep). Task loss 28.95 slightly worse than v1.1 (28.22) because domain gradient is real. Hit 200 ep limit still improving — needs more epochs or higher λ.
+
+## Next runs
+
+| # | Change | Run name |
+|---|--------|----------|
+| 2.1 | extend to 400 epochs | `exp-v2.1_encoder-lipschitz_dann_flow-maf5` |
+| 2.2 | higher λ (0.3–0.5) | `exp-v2.2_encoder-lipschitz_dann_flow-maf5` |
+| 2.3 | add Mixup on real beats | `exp-v2.3_encoder-lipschitz_dann_flow-maf5` |
+| 3 | VAE encoder + WDGRL | `exp-v3_encoder-vae_dann_flow-maf5` |
+
+## WDGRL implementation notes (v2+)
 
 Three-phase schedule: flow-warmup (enc frozen) → enc-warmup (flow frozen, WDGRL at λ_warm=0.01) → joint (enc+flow+WDGRL, λ ramps to target).
 
