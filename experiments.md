@@ -7,7 +7,7 @@
 | 1 | lipschitz (64-dim) | flow-maf5 | `exp-v1_encoder-lipschitz_dann_flow-maf5` | task=30.24, dom=0.0014 (BCE saturated) |
 | 1.1 | lipschitz (128-dim) | flow-maf5 | `exp-v1.1_encoder-lipschitz_dann_flow-maf5` | task=28.22, dom=0.0003 (BCE saturated) |
 | 1.3 | lipschitz (64-dim, λ=0.5) | flow-maf5 | `exp-v1.3_encoder-lipschitz_dann_flow-maf5` | task=29.43, dom=0.0002 (BCE saturated) |
-| 2 | lipschitz (128-dim) | WDGRL + flow-maf5 | `exp-v2_encoder-lipschitz_dann_flow-maf5` | task=28.95, w1=2.0↓ (hit 200 ep, still improving) |
+| 2 | lipschitz (128-dim) | WDGRL + flow-maf5 | `exp-v2_encoder-lipschitz_dann_flow-maf5` | task=28.95, w1=2.0↓ (hit 200 ep) |
 
 **v1 finding**: BCE saturates to ~0 regardless of λ; encoder gets near-zero domain gradient. 128-dim latent improves flow quality independently.
 
@@ -20,9 +20,9 @@ Gate for v3: confirm adversarial tension (W1 and task diverge under higher λ) a
 
 | # | Change | Run name | Status |
 |---|--------|----------|--------|
-| 2.1 | 400 epochs, λ=0.1 | `exp-v2.1_encoder-lipschitz_dann_flow-maf5` | running (adamant GPU 1) |
-| 2.2 | λ=0.3, 60-ep ramp | `exp-v2.2_encoder-lipschitz_dann_flow-maf5` | running (adamant GPU 0) |
-| 2.3 | λ=0.5, 100-ep ramp | `exp-v2.3_encoder-lipschitz_dann_flow-maf5` | queued (GPU 1 when v2.1 done) |
+| 2.1 | 400 epochs, λ=0.1 | `exp-v2.1_encoder-lipschitz_dann_flow-maf5` | done — task=20.56, w1=1.65 at ep400 (hit max, still improving) |
+| 2.2 | λ=0.3, 60-ep ramp | `exp-v2.2_encoder-lipschitz_dann_flow-maf5` | done — task=23.75, w1=1.23 at ep400 |
+| 2.3 | λ=0.5, 100-ep ramp | `exp-v2.3_encoder-lipschitz_dann_flow-maf5` | done — task=23.97, w1=0.96 at ep400 |
 
 ### v3 series — scale up (300k sims, reals augmented to ~300k via Mixup, best v2 hyperparams)
 Gate for v4: v3 confirms alignment at scale; Mixup note: interpolated reals add critic diversity but no new physiology.
