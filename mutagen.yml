@@ -16,23 +16,6 @@ sync:
         - ".DS_Store"
         - "nohup.out"
         - "notebooks/"
-  cv-dann-sbi-olympus:
-    alpha: "."
-    beta: "sa4604@olympus:~/cv-dann-sbi"
-    mode: "two-way-resolved"
-    ignore:
-      paths:
-        - ".git"
-        - ".venv"
-        - "__pycache__"
-        - "*.pyc"
-        - "outputs/"
-        - "dry-runs/"
-        - "sbi-logs/"
-        - "*.log"
-        - ".DS_Store"
-        - "nohup.out"
-        - "notebooks/"
   cv-dann-sbi-mithril:
     alpha: "."
     beta: "sa4604@mithril:~/cv-dann-sbi"
