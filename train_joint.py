@@ -3,9 +3,9 @@ Joint training: LipschitzReducedAutoencoderEncoder + WDGRL + task head.
 
 Three-phase training schedule:
 
-  Phase 0  flow-warmup    encoder frozen, flow trains                      (sim only)
-  Phase 1  enc-warmup     flow frozen, encoder trains + WDGRL at λ_warm    (sim + real)
-  Phase 2  joint          encoder + flow + WDGRL, λ ramps to target         (sim + real)
+  Phase 0  flow-warmup    encoder frozen, flow trains        (sim only)
+  Phase 1  enc-warmup     flow frozen, encoder trains        (sim only, no domain pressure)
+  Phase 2  joint          encoder + flow + WDGRL, λ ramps    (sim + real)
 
 WDGRL: Wasserstein critic (MLP, no sigmoid) trained with WGAN-GP.
   - n_critic inner critic updates per encoder step, encoder detached during critic updates
@@ -234,8 +234,6 @@ def main():
     # WDGRL
     parser.add_argument("--lambda-target",     type=float, default=0.1,
                         help="WDGRL weight at full ramp")
-    parser.add_argument("--lambda-enc-warmup", type=float, default=0.01,
-                        help="WDGRL weight during encoder warmup phase (phase 1)")
     parser.add_argument("--lambda-schedule",   choices=["linear", "sigmoid"], default="linear",
                         help="λ ramp schedule in phase 2")
     parser.add_argument("--lambda-gamma",      type=float, default=10.0,
@@ -269,10 +267,7 @@ def main():
         return 2
 
     def get_lambda(epoch: int) -> float:
-        phase = get_phase(epoch)
-        if phase == 1:
-            return args.lambda_enc_warmup
-        if phase != 2:
+        if get_phase(epoch) != 2:
             return 0.0
         t = min(1.0, (epoch - enc_end) / max(1, args.lambda_warmup))
         if args.lambda_schedule == "linear":
@@ -299,8 +294,8 @@ def main():
     log(f"Run: {args.run}  v={args.version}  ({'dry' if is_dry else 'full'})")
     log(f"Objective: {args.objective}  Device: {DEVICE}")
     log(f"Phase boundaries — flow_end={flow_end}  enc_end={enc_end}  max={args.max_epochs}")
-    log(f"λ: enc_warmup={args.lambda_enc_warmup}  target={args.lambda_target}  "
-        f"schedule={args.lambda_schedule}  warmup_epochs={args.lambda_warmup}")
+    log(f"λ: target={args.lambda_target}  schedule={args.lambda_schedule}  "
+        f"warmup_epochs={args.lambda_warmup}")
     log(f"WDGRL: n_critic={args.n_critic}  gp_weight={args.gp_weight}  "
         f"critic_hidden={args.critic_hidden}")
 
@@ -385,7 +380,6 @@ def main():
             flow_end=flow_end, enc_end=enc_end,
             lambda_warmup=args.lambda_warmup, max_epochs=args.max_epochs,
             lambda_target=args.lambda_target,
-            lambda_enc_warmup=args.lambda_enc_warmup,
             lambda_schedule=args.lambda_schedule,
         ),
         wdgrl=dict(
@@ -415,7 +409,7 @@ def main():
     for epoch in range(1, args.max_epochs + 1):
         phase     = get_phase(epoch)
         lambda_e  = get_lambda(epoch)
-        use_wdgrl = (phase >= 1)
+        use_wdgrl = (phase == 2)
 
         encoder.train(); task_head.train(); critic.train()
 
