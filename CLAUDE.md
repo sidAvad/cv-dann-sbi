@@ -18,6 +18,7 @@ Forked from `cv-inverse-autoencoder` (the surrogate training repo).
 
 - HDF5 files under `<data-root>/train/` and `<data-root>/test/`; pass the root via `--data-root`
   - Adamant: `/media/local/SimData/hdf5/cv8/simset_10M_cv8Eed_20260314` (local NVMe — use this, not `/media/pulsar/` which is a slow network share)
+  - Mithril: `~/sim_data` (local copy, 110 GB, 139 train + 10 test files)
 - `manifest_train.json` / `manifest_test.json` live at `<data-root>/` (one level above the data dirs)
 - Each HDF5 group (`sim_NNNNNN`) holds `parameters/<key>` scalars and `waves/<key>` arrays of length 201
 - `norm_stats.json`: wave normalisation stats (not committed)

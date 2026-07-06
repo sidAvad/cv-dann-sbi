@@ -50,4 +50,4 @@ Per batch draw `batch_size` pairs `(i,j)` from 802 real beats, interpolate `x = 
 
 **Output sync mithril → adamant**: one-way Mutagen sessions configured in `mutagen.yml` (`outputs-mithril-to-adamant`, `dry-runs-mithril-to-adamant`). Start with `mutagen project start`.
 
-**Sim data on mithril**: copy in progress from `/media/pulsar/` to `/home/sa4604/sim_data/` (~114 GB). Once done, use `--sim-data-root ~/sim_data` for mithril runs. Update CLAUDE.md data layout section when confirmed.
+**Sim data on mithril**: done — 110 GB, 139 train + 10 test files at `/home/sa4604/sim_data/`. Use `--sim-data-root ~/sim_data` for mithril runs.
