@@ -29,7 +29,8 @@ Gate for v4: v3 confirms alignment at scale; Mixup note: interpolated reals add 
 
 | # | Change | Run name | Status |
 |---|--------|----------|--------|
-| 3 | 300k sims + Mixup reals | `exp-v3_encoder-lipschitz_dann_flow-maf5` | pending |
+| 3 | 300k sims + Mixup reals, λ=0.5, 100-ep ramp | `exp-v3_encoder-lipschitz_dann_flow-maf5` | done — task=12.84, w1=0.85 at ep400 (hit max, still improving) |
+| 3.1 | 1M sims + Mixup reals, λ=0.5, 100-ep ramp, 600 epochs | `exp-v3.1_encoder-lipschitz_dann_flow-maf5` | pending |
 
 ### v4 series — VAE encoder
 | # | Change | Run name | Status |
