@@ -61,6 +61,10 @@ Three-phase schedule: flow-warmup (enc frozen) → enc-warmup (flow frozen, WDGR
 
 Per batch draw `batch_size` pairs `(i,j)` from 802 real beats, interpolate `x = α·x_i + (1-α)·x_j` with `α ~ Beta(0.4, 0.4)`, optionally add Gaussian noise (σ_wave≈0.03, σ_scalar≈0.01). Expands effective diversity from 802 to ~321k unique pairs per epoch.
 
+## Low-priority next steps
+
+- **Prior acceptance rate**: v3 eval shows ~5% acceptance (50/1000 samples in-prior per patient). Not a problem — 50 samples gives stable posterior means. Low-pri: try evaluating without prior filter and compare scatter plots to see if it changes results meaningfully.
+
 ## Infra
 
 **Output sync mithril → adamant**: one-way Mutagen sessions configured in `mutagen.yml` (`outputs-mithril-to-adamant`, `dry-runs-mithril-to-adamant`). Start with `mutagen project start`.
