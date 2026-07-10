@@ -36,18 +36,25 @@ Gate for v4: v3 confirms alignment at scale; Mixup note: interpolated reals add 
 | 3 | 300k sims + Mixup reals, λ=0.5, 100-ep ramp | `exp-v3_encoder-lipschitz_dann_flow-maf5` | done — task=12.84, w1=0.85 at ep400; sim: Ras R²=0.998/MAPE=0.8%, Rap R²=1.000/MAPE=1.4%, coverage mean=0.919 @ 90% CI; real: SVR MAPE=4.4% R²=0.968, PVR MAPE=12.7% R²=0.940 |
 | 3.1 | 1M sims + Mixup reals, λ=0.5, 100-ep ramp, 600 epochs | `exp-v3.1_encoder-lipschitz_dann_flow-maf5` | done — task=-3.13, w1=0.57 at ep600; sim: Ras R²=0.999/MAPE=0.6%, Rap R²=1.000/MAPE=1.0%, coverage mean=0.905 @ 90% CI; real: SVR MAPE=10.4% R²=0.714, PVR MAPE=21.0% R²=0.802 |
 
-### v3.2 — stronger adversarial pressure at 1M sims + 1M Mixup reals
+### v3.2 — stronger adversarial pressure at 1M sims
 **Hypothesis**: v3.1 showed that sharper posteriors (1M sims) amplify residual domain shift — flow peaks
 become narrow enough that small encoder misalignment lands in the wrong mode on real patients. The fix
-is to scale adversarial pressure with sim count: higher λ forces tighter alignment before the flow
-sharpens. Also augment Mixup reals to 1M to match sim scale and give the critic more diverse real samples.
+is to scale adversarial pressure with sim count: higher λ forces tighter alignment before the flow sharpens.
+
+**Mixup real scaling**: on-the-fly, so automatically ~1M encoder-facing + 5M critic-facing samples/epoch
+at 1M sims (vs 300k + 1.5M for v3). All from 802 source patients — denser coverage of the same convex
+hull each epoch, not new diversity. This caps how high λ can usefully go before over-aligning to the
+802-patient sample.
+
+**λ=2, 400-ep ramp**: same ramp rate as v3 (0.005/ep), continuing to a higher target. Encoder trajectory
+directly comparable to v3 for first 100 epochs then keeps climbing; ~150 epochs at full λ=2.
 
 | # | Change | Run name | Status |
 |---|--------|----------|--------|
-| 3.2 | 1M sims, Mixup reals →1M, λ=1.0 (TBD), 100-ep ramp, 600 ep | `exp-v3.2_encoder-lipschitz_dann_flow-maf5` | pending |
+| 3.2 | 1M sims, λ=2, 400-ep ramp, 600 ep | `exp-v3.2_encoder-lipschitz_dann_flow-maf5` | pending |
 
-λ target TBD — gate on 1-NN proxy results from v3/v3.1 notebooks first. If proxy improves over direct
-on v3.1 more than on v3, it confirms domain shift is the bottleneck and higher λ is the right lever.
+Gate on 1-NN proxy results first: if proxy closes the gap more on v3.1 than v3, domain shift is the
+bottleneck and v3.2 is the right next run.
 
 ### v4 series — VAE encoder
 | # | Change | Run name | Status |
