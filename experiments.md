@@ -24,13 +24,30 @@ Gate for v3: confirm adversarial tension (W1 and task diverge under higher λ) a
 | 2.2 | λ=0.3, 60-ep ramp | `exp-v2.2_encoder-lipschitz_dann_flow-maf5` | done — task=23.75, w1=1.23 at ep400 |
 | 2.3 | λ=0.5, 100-ep ramp | `exp-v2.3_encoder-lipschitz_dann_flow-maf5` | done — task=23.97, w1=0.96 at ep400 |
 
+**v3.1 finding**: Sim metrics improve substantially over v3 (tighter posteriors, task=-3.1 nats). But real patient performance is worse: Rap R² 0.940→0.802, Ras R² 0.968→0.714, Emax_RV collapses (PAH std=3.79, MWU p=0.97). Root cause: flow posteriors are so sharp that residual encoder domain shift now lands in the wrong narrow peak. Lower W1 (0.57 vs 0.85) didn't compensate. Real patient calibration similarly poor in both (90% CI coverage ~10%) — posteriors are calibrated for noiseless sims; real measurement noise falls outside them. **v3 remains the best model for real patients.** For v4: consider sim observation noise augmentation or posterior temperature scaling to improve real-patient robustness.
+
+**v3 finding**: Calibration is excellent (mean 90% CI coverage = 0.919 across all 24 params, range 0.887–0.950). Hemodynamic resistance params (Ras, Rap) near-perfect on sims; Emax_RV, Tmax, τ also strong. Compliance/timing params (Eedref_*, Bla/Blv/Bra/Brv, τ_a) have poor R² (0.04–0.42) — structurally unidentifiable from 4 pressure waves + 5 scalars. Real patient SVR/PVR results strong; Cas/Eap GT unreliable on real data. Sim→real gap for Cas (sim MAPE=1.4% → real 25%) reflects residual domain shift; expect improvement at 1M sims.
+
 ### v3 series — scale up (300k sims, reals augmented to ~300k via Mixup, best v2 hyperparams)
 Gate for v4: v3 confirms alignment at scale; Mixup note: interpolated reals add critic diversity but no new physiology.
 
 | # | Change | Run name | Status |
 |---|--------|----------|--------|
-| 3 | 300k sims + Mixup reals, λ=0.5, 100-ep ramp | `exp-v3_encoder-lipschitz_dann_flow-maf5` | done — task=12.84, w1=0.85 at ep400 (hit max, still improving) |
-| 3.1 | 1M sims + Mixup reals, λ=0.5, 100-ep ramp, 600 epochs | `exp-v3.1_encoder-lipschitz_dann_flow-maf5` | pending |
+| 3 | 300k sims + Mixup reals, λ=0.5, 100-ep ramp | `exp-v3_encoder-lipschitz_dann_flow-maf5` | done — task=12.84, w1=0.85 at ep400; sim: Ras R²=0.998/MAPE=0.8%, Rap R²=1.000/MAPE=1.4%, coverage mean=0.919 @ 90% CI; real: SVR MAPE=4.4% R²=0.968, PVR MAPE=12.7% R²=0.940 |
+| 3.1 | 1M sims + Mixup reals, λ=0.5, 100-ep ramp, 600 epochs | `exp-v3.1_encoder-lipschitz_dann_flow-maf5` | done — task=-3.13, w1=0.57 at ep600; sim: Ras R²=0.999/MAPE=0.6%, Rap R²=1.000/MAPE=1.0%, coverage mean=0.905 @ 90% CI; real: SVR MAPE=10.4% R²=0.714, PVR MAPE=21.0% R²=0.802 |
+
+### v3.2 — stronger adversarial pressure at 1M sims + 1M Mixup reals
+**Hypothesis**: v3.1 showed that sharper posteriors (1M sims) amplify residual domain shift — flow peaks
+become narrow enough that small encoder misalignment lands in the wrong mode on real patients. The fix
+is to scale adversarial pressure with sim count: higher λ forces tighter alignment before the flow
+sharpens. Also augment Mixup reals to 1M to match sim scale and give the critic more diverse real samples.
+
+| # | Change | Run name | Status |
+|---|--------|----------|--------|
+| 3.2 | 1M sims, Mixup reals →1M, λ=1.0 (TBD), 100-ep ramp, 600 ep | `exp-v3.2_encoder-lipschitz_dann_flow-maf5` | pending |
+
+λ target TBD — gate on 1-NN proxy results from v3/v3.1 notebooks first. If proxy improves over direct
+on v3.1 more than on v3, it confirms domain shift is the bottleneck and higher λ is the right lever.
 
 ### v4 series — VAE encoder
 | # | Change | Run name | Status |
@@ -61,9 +78,13 @@ Three-phase schedule: flow-warmup (enc frozen) → enc-warmup (flow frozen, WDGR
 
 Per batch draw `batch_size` pairs `(i,j)` from 802 real beats, interpolate `x = α·x_i + (1-α)·x_j` with `α ~ Beta(0.4, 0.4)`, optionally add Gaussian noise (σ_wave≈0.03, σ_scalar≈0.01). Expands effective diversity from 802 to ~321k unique pairs per epoch.
 
-## Low-priority next steps
+## Next steps
 
-- **Prior acceptance rate**: v3 eval shows ~5% acceptance (50/1000 samples in-prior per patient). Not a problem — 50 samples gives stable posterior means. Low-pri: try evaluating without prior filter and compare scatter plots to see if it changes results meaningfully.
+- **Prior acceptance rate**: v3 eval shows ~5% acceptance (50/1000 samples in-prior per patient). Not a problem — 50 samples gives stable posterior means. Try evaluating without prior filter and compare scatter plots to see if it changes results meaningfully.
+
+- **Stochastic encoder + parameter decoder (implicit posterior)**: replace the flow with a stochastic encoder x → (μ_z, σ_z) and a deterministic MLP decoder z → θ. Posterior at inference: sample z₁...z_N ~ q(z|x), push through decoder — {θ̂_i} is the posterior. Training objective is MSE/NLL on θ directly (no reconstruction of x). Needs mild KL(q(z|x) ∥ N(0,I)) regularisation to prevent σ collapse; WDGRL alignment applies in z-space as before. Calibration check is identical to current approach (coverage of true θ in percentile intervals of {θ̂_i}). Simpler and faster than flow; posterior is implicit but fully sampleable.
+
+- **SPIN domain translation (v5)**: train G_sr (sim→real) and G_rs (real→sim) generators on raw observations. Cycle x_sim → G_sr → G_rs = x_srs retains θ labels; information-preservation loss = MI(θ; x_srs) via flow log-prob. At test time: x_real → G_rs → encoder → flow → posterior. No real labels needed. Start with frozen v3 encoder+flow (v5a), then try with v4 VAE encoder (v5b). Keep generators small (1D ResNet, 3–4 blocks) given only 802 real patients for discriminator. Gate: if v5a fails, 802 reals is likely too few for the discriminator — v5b won't help.
 
 ## Infra
 
