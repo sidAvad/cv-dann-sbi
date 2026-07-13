@@ -51,10 +51,25 @@ directly comparable to v3 for first 100 epochs then keeps climbing; ~150 epochs 
 
 | # | Change | Run name | Status |
 |---|--------|----------|--------|
-| 3.2 | 1M sims, λ=2, 400-ep ramp, 600 ep | `exp-v3.2_encoder-lipschitz_dann_flow-maf5` | pending |
+| 3.2 | 1M sims, λ=2, 400-ep ramp, 600 ep | `exp-v3.2_encoder-lipschitz_dann_flow-maf5` | done — task=-1.70, w1=0.38 at ep600; real patient eval pending (run `v3-series_real-patient-alignment.ipynb`) |
+| 3.3 | 300k sims subsetted to PCA-nearest to reals, λ=0.5, 100-ep ramp | `exp-v3.3_encoder-lipschitz_dann_flow-maf5` | pending — run after/alongside v4 |
 
-Gate on 1-NN proxy results first: if proxy closes the gap more on v3.1 than v3, domain shift is the
-bottleneck and v3.2 is the right next run.
+### v3.3 — PCA-filtered sim subset
+**Hypothesis**: the sim prior covers a much broader physiological space than the 802 real patients occupy.
+Training on all 300k random sims wastes capacity on regions the flow will never be queried on, and forces
+WDGRL to align distributions with partially non-overlapping support. Filtering to the 300k sims nearest
+the real patients in shared-channel observation space concentrates the training distribution on the relevant
+region, reducing the domain gap before WDGRL even starts.
+
+**Implementation**: use the 4 shared waveform channels (Prv, Pra, Pvp, Pap) + hemodynamic scalars to
+compute PCA over a large sim pool (≥1M sims). Encode real patients in the same PCA space. For each real
+patient find the k≈375 nearest sims (union → ~300k unique indices). Save as a filtered manifest for
+training. All other hyperparams identical to v3 (λ=0.5, 100-ep ramp, 400 epochs) so the comparison is
+clean. Sanity check: plot selected sim parameter distribution vs full prior to confirm coverage of
+PAH/control ranges.
+
+**Note**: Mixup diversity is bounded by 802-patient convex hull regardless of sim count — this is not
+fixed by v3.3 but the sim/real waveform overlap improves directly.
 
 ### v4 series — VAE encoder
 | # | Change | Run name | Status |
