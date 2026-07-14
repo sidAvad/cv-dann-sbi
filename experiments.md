@@ -74,7 +74,8 @@ fixed by v3.3 but the sim/real waveform overlap improves directly.
 ### v4 series — VAE encoder
 | # | Change | Run name | Status |
 |---|--------|----------|--------|
-| 4 | VAE encoder + WDGRL, 300k sims, λ=0.5, 100-ep ramp | `exp-v4_encoder-vae_dann_flow-maf5` | running |
+| 4 | VAE encoder + WDGRL, 300k sims, λ=0.5, 100-ep ramp, kl=1e-4 | `exp-v4_encoder-vae_dann_flow-maf5` | done — task=9.57, w1=1.58 at ep400 (hit max); KL unregularized (kl_weight too small) |
+| 4.1 | VAE encoder, kl_weight=1e-2, 600 epochs | `exp-v4.1_encoder-vae_dann_flow-maf5` | running |
 
 ## WDGRL implementation notes (v2+)
 
