@@ -57,6 +57,7 @@ from dataset import (
 )
 from models import (
     LipschitzReducedAutoencoderEncoder,
+    VAEReducedAutoencoderEncoder,
     WaveformDecoder,
     WassersteinCritic,
 )
@@ -223,9 +224,13 @@ def main():
     parser.add_argument("--real-data",     required=True)
     parser.add_argument("--n-sims",        type=int, default=None)
     # Encoder
+    parser.add_argument("--encoder-type",  choices=["lipschitz", "vae"], default="lipschitz")
     parser.add_argument("--latent-dim",    type=int,   default=128)
-    parser.add_argument("--sn-ceiling",    type=float, default=2.0)
+    parser.add_argument("--sn-ceiling",    type=float, default=2.0,
+                        help="Spectral norm ceiling (lipschitz encoder only)")
     parser.add_argument("--proj-hidden",   type=int,   default=None)
+    parser.add_argument("--kl-weight",     type=float, default=1e-4,
+                        help="Beta weight on KL term (VAE encoder only)")
     # Flow (ignored for reconstruction)
     parser.add_argument("--hidden-features", type=int, default=None,
                         help="Default: 128 for MAF, 256 for NSF")
@@ -311,6 +316,8 @@ def main():
     log(f"WDGRL: n_critic={args.n_critic}  gp_weight={args.gp_weight}  "
         f"critic_hidden={args.critic_hidden}")
     log(f"Mixup: {'on' if args.use_mixup else 'off'}  alpha={args.mixup_alpha}")
+    log(f"Encoder type: {args.encoder_type}"
+        + (f"  kl_weight={args.kl_weight}" if args.encoder_type == "vae" else ""))
 
     # ── Load data ──────────────────────────────────────────────────────────────
     stats    = load_stats(STATS_PATH)
@@ -333,11 +340,18 @@ def main():
     real_beats = real_beats.to(DEVICE)
 
     # ── Build models ───────────────────────────────────────────────────────────
-    encoder = LipschitzReducedAutoencoderEncoder(
-        latent_dim=args.latent_dim,
-        sn_ceiling=args.sn_ceiling,
-        proj_hidden=args.proj_hidden,
-    ).to(DEVICE)
+    is_vae = args.encoder_type == "vae"
+    if is_vae:
+        encoder = VAEReducedAutoencoderEncoder(
+            latent_dim=args.latent_dim,
+            proj_hidden=args.proj_hidden,
+        ).to(DEVICE)
+    else:
+        encoder = LipschitzReducedAutoencoderEncoder(
+            latent_dim=args.latent_dim,
+            sn_ceiling=args.sn_ceiling,
+            proj_hidden=args.proj_hidden,
+        ).to(DEVICE)
     log(f"Encoder: {encoder.describe()}")
 
     if is_flow:
@@ -376,6 +390,7 @@ def main():
         command=" ".join(sys.argv),
         git_hash=git_hash(),
         device=DEVICE,
+        encoder_type=args.encoder_type,
         encoder=encoder.describe(),
         task_head=dict(
             type=args.objective,
@@ -402,7 +417,8 @@ def main():
             use_mixup=args.use_mixup,
             mixup_alpha=args.mixup_alpha,
         ),
-        training=dict(lr=args.lr, batch_size=args.batch_size, patience=args.patience),
+        training=dict(lr=args.lr, batch_size=args.batch_size, patience=args.patience,
+                      kl_weight=args.kl_weight if is_vae else None),
     )
     info_path = run_dir / f"run_info_v{args.version}.json"
     info_path.write_text(json.dumps(run_info, indent=2))
@@ -418,7 +434,7 @@ def main():
     csv_path   = run_dir / f"train_log_{date_str}.csv"
     csv_fh     = open(csv_path, "w", newline="")
     csv_writer = csv.writer(csv_fh)
-    csv_writer.writerow(["epoch", "task", "w1_est", "gp", "total", "lambda", "phase"])
+    csv_writer.writerow(["epoch", "task", "kl", "w1_est", "gp", "total", "lambda", "phase"])
 
     log("Training...")
     for epoch in range(1, args.max_epochs + 1):
@@ -429,7 +445,7 @@ def main():
         encoder.train(); task_head.train(); critic.train()
 
         perm = torch.randperm(n_total)
-        ep_task = ep_w1 = ep_gp = ep_tot = 0.0
+        ep_task = ep_kl = ep_w1 = ep_gp = ep_tot = 0.0
         n_batches = 0
 
         for start in range(0, n_total, args.batch_size):
@@ -443,12 +459,17 @@ def main():
                 idx = torch.randint(0, len(real_beats), (n,), device=DEVICE)
                 return real_beats[idx]
 
+            def _encode_z(x):
+                """Return just z, discarding mu/log_var for VAE."""
+                out = encoder(x)
+                return out[0] if is_vae else out
+
             # ── Critic inner loop (phase 2 only) ──────────────────────────────
             batch_gp = 0.0
             if use_wdgrl:
                 for _ in range(args.n_critic):
-                    z_sim_d  = encoder(x_sim_b).detach()
-                    z_real_d = encoder(sample_real(len(idx))).detach()
+                    z_sim_d  = _encode_z(x_sim_b).detach()
+                    z_real_d = _encode_z(sample_real(len(idx))).detach()
                     gp       = gradient_penalty(critic, z_sim_d, z_real_d, DEVICE)
                     w_diff   = critic(z_sim_d).mean() - critic(z_real_d).mean()
                     c_loss   = -w_diff + args.gp_weight * gp
@@ -459,7 +480,12 @@ def main():
                 batch_gp /= args.n_critic
 
             # ── Encoder + flow step ───────────────────────────────────────────
-            z_sim = encoder(x_sim_b)
+            if is_vae:
+                z_sim, mu_sim, log_var_sim = encoder(x_sim_b)
+                kl_loss = -0.5 * (1 + log_var_sim - mu_sim**2 - log_var_sim.exp()).sum(-1).mean()
+            else:
+                z_sim   = encoder(x_sim_b)
+                kl_loss = x_sim_b.new_zeros(1).squeeze()
 
             if is_flow:
                 task_loss = -task_head.log_prob(theta_b, condition=z_sim).mean()
@@ -467,14 +493,14 @@ def main():
                 task_loss = F.mse_loss(task_head(z_sim), x_sim_b[:, :WAVE_LEN])
 
             if use_wdgrl:
-                z_real = encoder(sample_real(len(idx)))
+                z_real = _encode_z(sample_real(len(idx)))
                 w1_est      = critic(z_sim).mean() - critic(z_real).mean()
                 domain_loss = w1_est
             else:
                 domain_loss = x_sim_b.new_zeros(1).squeeze()
                 w1_est      = domain_loss
 
-            total = task_loss + lambda_e * domain_loss
+            total = task_loss + lambda_e * domain_loss + args.kl_weight * kl_loss
 
             enc_opt.zero_grad(); flow_opt.zero_grad()
             total.backward()
@@ -490,19 +516,21 @@ def main():
                 enc_opt.step(); flow_opt.step()
 
             ep_task += task_loss.item()
+            ep_kl   += kl_loss.item()
             ep_w1   += w1_est.item()
             ep_gp   += batch_gp
             ep_tot  += total.item()
             n_batches += 1
 
         avg_task = ep_task / n_batches
+        avg_kl   = ep_kl   / n_batches
         avg_w1   = ep_w1   / n_batches
         avg_gp   = ep_gp   / n_batches
         avg_tot  = ep_tot  / n_batches
 
         csv_writer.writerow([epoch,
-                             f"{avg_task:.5f}", f"{avg_w1:.5f}", f"{avg_gp:.5f}",
-                             f"{avg_tot:.5f}", f"{lambda_e:.4f}", phase])
+                             f"{avg_task:.5f}", f"{avg_kl:.5f}", f"{avg_w1:.5f}",
+                             f"{avg_gp:.5f}", f"{avg_tot:.5f}", f"{lambda_e:.4f}", phase])
         csv_fh.flush()
 
         if phase == 2 and avg_tot < best_loss:
@@ -515,8 +543,9 @@ def main():
 
         if epoch % args.log_every == 0 or epoch == 1:
             phase_name = ["flow-warmup", "enc-warmup", "joint"][phase]
+            kl_str = f"  kl={avg_kl:.4f}" if is_vae else ""
             log(f"  ep {epoch:4d}/{args.max_epochs}  [{phase_name}]"
-                f"  task={avg_task:.4f}  w1={avg_w1:.4f}  gp={avg_gp:.4f}"
+                f"  task={avg_task:.4f}{kl_str}  w1={avg_w1:.4f}  gp={avg_gp:.4f}"
                 f"  total={avg_tot:.4f}  λ={lambda_e:.3f}  wait={wait}")
 
         if phase == 2 and wait >= args.patience:
