@@ -220,9 +220,11 @@ def main():
     parser.add_argument("--objective",
                         choices=["flow-maf5", "flow-nsf8", "reconstruction"], required=True)
     # Data
-    parser.add_argument("--sim-data-root", required=True)
-    parser.add_argument("--real-data",     required=True)
-    parser.add_argument("--n-sims",        type=int, default=None)
+    parser.add_argument("--sim-data-root",   required=True)
+    parser.add_argument("--real-data",       required=True)
+    parser.add_argument("--manifest-train",  default="manifest_train.json",
+                        help="Manifest filename under sim-data-root (default: manifest_train.json)")
+    parser.add_argument("--n-sims",          type=int, default=None)
     # Encoder
     parser.add_argument("--encoder-type",  choices=["lipschitz", "vae"], default="lipschitz")
     parser.add_argument("--latent-dim",    type=int,   default=128)
@@ -321,7 +323,7 @@ def main():
 
     # ── Load data ──────────────────────────────────────────────────────────────
     stats    = load_stats(STATS_PATH)
-    manifest = load_manifest(Path(args.sim_data_root) / "manifest_train.json")
+    manifest = load_manifest(Path(args.sim_data_root) / args.manifest_train)
 
     log(f"Loading {n_sims} sim observations...")
     theta_all, x_all = load_sim_data(
