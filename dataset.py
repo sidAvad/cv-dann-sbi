@@ -154,10 +154,11 @@ class ReducedCVDataset(Dataset):
                              scalars: Pas mean, Pas max, Pas min, SV, HR_z
     """
 
-    def __init__(self, data_dir, index_entries, stats):
-        self.data_dir = data_dir
-        self.index = index_entries
-        self._handles = {}
+    def __init__(self, data_dir, index_entries, stats, include_sv: bool = True):
+        self.data_dir   = data_dir
+        self.index      = index_entries
+        self._handles   = {}
+        self.include_sv = include_sv
 
         w = stats["waves"]
         p = stats["parameters"]
@@ -211,17 +212,18 @@ class ReducedCVDataset(Dataset):
         pas_max  = pas_z.max()
         pas_min  = pas_z.min()
 
-        # SV from z-scored Vlv
-        vlv_z = torch.from_numpy(g["waves/Vlv"][:].astype(np.float32))
-        vlv_z = (vlv_z - self._vlv_mean) / self._vlv_std
-        sv = vlv_z.max() - vlv_z.min()
-
         # HR z-scored
         hr_z = torch.tensor((hr_raw - self._hr_mean) / self._hr_std, dtype=torch.float32)
 
-        scalars = torch.stack([pas_mean, pas_max, pas_min, sv, hr_z])  # (5,)
+        if self.include_sv:
+            vlv_z = torch.from_numpy(g["waves/Vlv"][:].astype(np.float32))
+            vlv_z = (vlv_z - self._vlv_mean) / self._vlv_std
+            sv = vlv_z.max() - vlv_z.min()
+            scalars = torch.stack([pas_mean, pas_max, pas_min, sv, hr_z])  # (5,)
+        else:
+            scalars = torch.stack([pas_mean, pas_max, pas_min, hr_z])      # (4,)
 
-        x = torch.cat([waves.reshape(-1), scalars])  # (809,)
+        x = torch.cat([waves.reshape(-1), scalars])  # (809,) or (808,)
 
         return theta_infer, x
 

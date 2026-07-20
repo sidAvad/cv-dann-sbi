@@ -54,6 +54,7 @@ directly comparable to v3 for first 100 epochs then keeps climbing; ~150 epochs 
 | 3.2 | 1M sims, λ=2, 400-ep ramp, 600 ep | `exp-v3.2_encoder-lipschitz_dann_flow-maf5` | done — task=-1.70, w1=0.38 at ep600; real patient eval pending (run `v3-series_real-patient-alignment.ipynb`) |
 | 3.3 | 300k sims subsetted to PCA-nearest to reals, λ=0.5, 100-ep ramp | `exp-v3.3_encoder-lipschitz_dann_flow-maf5` | pending — manifest ready, waiting on v3b results before launching |
 | 3b | 300k sims, λ=0.5, 100-ep ramp, real inputs z-scored with real stats | `exp-v3b_encoder-lipschitz_dann_flow-maf5` | queued |
+| 3c | 300k sims, λ=0.5, 100-ep ramp, no SV scalar (808-dim input) | `exp-v3c_encoder-lipschitz_dann_flow-maf5` | queued |
 
 ### v3b — real-data normalisation
 
@@ -83,6 +84,20 @@ possible comparison.
 **Implementation**: `--real-norm-stats real_norm_stats.json` flag in `train_joint.py`. Stats computed
 by `scripts/compute_real_stats.py` and saved to `real_norm_stats.json` (not committed — generated on
 adamant from the 802 real patient H5 files).
+
+### v3c — no SV input
+
+**Hypothesis**: SV is a right-heart-derived scalar (from Vlv waveform in sims, from thermodilution/echo in reals). It may be causing domain shift and is not measured in a standard cath lab. Removing it gives a clean 808-dim observation (4 pressure waveforms + Pas mean/max/min + HR) that is fully catheterisation-derivable. If SV is truly identifiable from pressure waveforms alone, removing it should not hurt inference. If it hurts, that tells us it was providing real information that the waveforms don't encode.
+
+**Run command**: same as v3 + `--no-sv --version 3c`
+
+---
+
+### Future: proper scalar normalisation
+
+Currently Pas scalars (mean/max/min) for sims are derived by z-scoring the Pas waveform then taking mean/max/min — equivalent to `(MAP - µ_wave) / σ_wave` where σ_wave includes within-beat pulsatile variation, not just between-sim variation. The right approach for all 5 scalars is: extract one summary per sim/real (MAP, SBP, DBP, SV, HR), then z-score using the distribution of that summary across sims (for sims) or across reals (for reals). Requires computing sim scalar stats (MAP/SBP/DBP/SV mean/std across sims) and storing in `norm_stats.json["scalars"]`, with a `--scalar-norm zscore` flag for backward compatibility.
+
+---
 
 ### v3.3 — PCA-filtered sim subset
 **Hypothesis**: the sim prior covers a much broader physiological space than the 802 real patients occupy.

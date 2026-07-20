@@ -318,11 +318,13 @@ class LipschitzReducedAutoencoderEncoder(nn.Module):
 
     CONV_LAYERS = ReducedAutoencoderEncoder.CONV_LAYERS
 
-    def __init__(self, latent_dim: int = LATENT_DIM, sn_ceiling: float = 2.0, proj_hidden=None):
+    def __init__(self, latent_dim: int = LATENT_DIM, sn_ceiling: float = 2.0,
+                 proj_hidden=None, n_scalars: int = N_SCALARS):
         super().__init__()
         self.latent_dim  = latent_dim
         self.sn_ceiling  = sn_ceiling
         self.proj_hidden = proj_hidden
+        self.n_scalars   = n_scalars
         self.wave_len    = N_REDUCED_CHANNELS * T
         feat_dim = self.CONV_LAYERS[-1][1]
 
@@ -334,7 +336,7 @@ class LipschitzReducedAutoencoderEncoder(nn.Module):
             ]
         self.cnn          = nn.Sequential(*layers)
         self.scalar_projs = nn.ModuleList(
-            [_sn(nn.Linear(1, feat_dim), sn_ceiling) for _ in range(N_SCALARS)]
+            [_sn(nn.Linear(1, feat_dim), sn_ceiling) for _ in range(n_scalars)]
         )
         self.attn_pool    = _sn(nn.Linear(feat_dim, 1), sn_ceiling)
 
@@ -357,10 +359,12 @@ class LipschitzReducedAutoencoderEncoder(nn.Module):
         return out
 
     def describe(self):
+        scalars_str = ("Pas_mean, Pas_max, Pas_min, HR_z" if self.n_scalars == 4
+                       else "Pas_mean, Pas_max, Pas_min, SV, HR_z")
         return {
             "type": "LipschitzReducedAutoencoderEncoder",
             "input_waveforms": f"({N_REDUCED_CHANNELS}, {T})",
-            "input_scalars": "Pas_mean, Pas_max, Pas_min, SV, HR_z",
+            "input_scalars": scalars_str,
             "latent_dim": self.latent_dim,
             "proj_hidden": self.proj_hidden,
             "sn_ceiling": self.sn_ceiling,

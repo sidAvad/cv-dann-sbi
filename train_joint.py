@@ -134,9 +134,10 @@ def gradient_penalty(critic: nn.Module, z_sim: torch.Tensor,
 
 # ─── Data loading ─────────────────────────────────────────────────────────────
 
-def load_sim_data(data_dir: Path, manifest: dict, stats: dict, n: int, log):
+def load_sim_data(data_dir: Path, manifest: dict, stats: dict, n: int, log,
+                  include_sv: bool = True):
     index   = manifest["index"][:n]
-    dataset = ReducedCVDataset(str(data_dir), index, stats)
+    dataset = ReducedCVDataset(str(data_dir), index, stats, include_sv=include_sv)
     loader  = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
     thetas, xs, loaded = [], [], 0
     for theta_b, x_b in loader:
@@ -153,7 +154,8 @@ def load_sim_data(data_dir: Path, manifest: dict, stats: dict, n: int, log):
 
 
 def load_real_beats(data_dir: Path, stats: dict, log,
-                    real_stats: dict | None = None) -> torch.Tensor:
+                    real_stats: dict | None = None,
+                    include_sv: bool = True) -> torch.Tensor:
     """Load all patient beats into a flat tensor (N_beats, OBS_DIM).
 
     If real_stats is provided (from real_norm_stats.json), use it to z-score
@@ -193,13 +195,15 @@ def load_real_beats(data_dir: Path, stats: dict, log,
                 map_  = float(g["summaries/map"][()])
                 sv    = float(g["summaries/sv"][()])
                 hr    = float(g["parameters/HR"][()])
-                sc    = torch.tensor([
+                sc_vals = [
                     (map_ - pas_mean) / pas_std,
                     (sbp  - pas_mean) / pas_std,
                     (dbp  - pas_mean) / pas_std,
-                    (sv   - sv_mean)  / sv_std,
-                    (hr   - hr_mean)  / hr_std,
-                ], dtype=torch.float32)
+                ]
+                if include_sv:
+                    sc_vals.append((sv - sv_mean) / sv_std)
+                sc_vals.append((hr - hr_mean) / hr_std)
+                sc = torch.tensor(sc_vals, dtype=torch.float32)
                 beats.append(torch.cat([wt.reshape(-1), sc]))
 
     real = torch.stack(beats)
@@ -242,6 +246,8 @@ def main():
     parser.add_argument("--real-norm-stats", default=None,
                         help="Path to real_norm_stats.json; if provided, real patient inputs "
                              "are z-scored with real-data statistics instead of sim statistics")
+    parser.add_argument("--no-sv", action="store_true",
+                        help="Drop SV scalar from observation (808-dim instead of 809-dim)")
     parser.add_argument("--manifest-train",  default="manifest_train.json",
                         help="Manifest filename under sim-data-root (default: manifest_train.json)")
     parser.add_argument("--n-sims",          type=int, default=None)
@@ -345,9 +351,11 @@ def main():
     stats    = load_stats(STATS_PATH)
     manifest = load_manifest(Path(args.sim_data_root) / args.manifest_train)
 
+    include_sv = not args.no_sv
     log(f"Loading {n_sims} sim observations...")
     theta_all, x_all = load_sim_data(
-        Path(args.sim_data_root) / "train", manifest, stats, n_sims, log
+        Path(args.sim_data_root) / "train", manifest, stats, n_sims, log,
+        include_sv=include_sv,
     )
 
     real_stats = None
@@ -356,7 +364,8 @@ def main():
             real_stats = json.load(f)
 
     log("Loading real patient beats...")
-    real_beats = load_real_beats(Path(args.real_data), stats, log, real_stats=real_stats)
+    real_beats = load_real_beats(Path(args.real_data), stats, log, real_stats=real_stats,
+                                 include_sv=include_sv)
 
     # ── Normalization sanity check ─────────────────────────────────────────────
     log(f"x_all      mean={x_all.mean():.4f}  std={x_all.std():.4f}  "
@@ -378,6 +387,7 @@ def main():
             latent_dim=args.latent_dim,
             sn_ceiling=args.sn_ceiling,
             proj_hidden=args.proj_hidden,
+            n_scalars=4 if args.no_sv else N_SCALARS,
         ).to(DEVICE)
     log(f"Encoder: {encoder.describe()}")
 
@@ -431,6 +441,7 @@ def main():
             sim_data_root=args.sim_data_root,
             real_data=args.real_data,
             real_norm_stats=args.real_norm_stats,
+            no_sv=args.no_sv,
         ),
         schedule=dict(
             flow_end=flow_end, enc_end=enc_end,
