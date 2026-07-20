@@ -152,15 +152,32 @@ def load_sim_data(data_dir: Path, manifest: dict, stats: dict, n: int, log):
     return theta_all, x_all
 
 
-def load_real_beats(data_dir: Path, stats: dict, log) -> torch.Tensor:
-    """Load all patient beats into a flat tensor (N_beats, OBS_DIM)."""
-    w = stats["waves"]
-    p = stats["parameters"]
-    wave_mean = torch.tensor([w[k]["mean"] for k in WAVE_KEYS_REAL], dtype=torch.float32).unsqueeze(1)
-    wave_std  = torch.tensor([w[k]["std"]  for k in WAVE_KEYS_REAL], dtype=torch.float32).unsqueeze(1)
-    pas_mean, pas_std = w["Pas"]["mean"], w["Pas"]["std"] + 1e-8
-    vlv_std           = w["Vlv"]["std"] + 1e-8
-    hr_mean,  hr_std  = p["HR"]["mean"],  p["HR"]["std"]  + 1e-8
+def load_real_beats(data_dir: Path, stats: dict, log,
+                    real_stats: dict | None = None) -> torch.Tensor:
+    """Load all patient beats into a flat tensor (N_beats, OBS_DIM).
+
+    If real_stats is provided (from real_norm_stats.json), use it to z-score
+    real patient waveforms and scalars instead of the sim-derived stats.
+    """
+    # Wave and scalar normalization constants — prefer real stats if provided
+    if real_stats is not None:
+        rw = real_stats["waves"]
+        rs = real_stats["scalars"]
+        wave_mean = torch.tensor([rw[k]["mean"] for k in WAVE_KEYS_REAL], dtype=torch.float32).unsqueeze(1)
+        wave_std  = torch.tensor([rw[k]["std"]  for k in WAVE_KEYS_REAL], dtype=torch.float32).unsqueeze(1)
+        pas_mean, pas_std = rs["Pas"]["mean"], rs["Pas"]["std"] + 1e-8
+        sv_mean,  sv_std  = rs["sv"]["mean"],  rs["sv"]["std"]  + 1e-8
+        hr_mean,  hr_std  = rs["HR"]["mean"],  rs["HR"]["std"]  + 1e-8
+        log("Real beats: using real_norm_stats for normalisation")
+    else:
+        w = stats["waves"]
+        p = stats["parameters"]
+        wave_mean = torch.tensor([w[k]["mean"] for k in WAVE_KEYS_REAL], dtype=torch.float32).unsqueeze(1)
+        wave_std  = torch.tensor([w[k]["std"]  for k in WAVE_KEYS_REAL], dtype=torch.float32).unsqueeze(1)
+        pas_mean, pas_std = w["Pas"]["mean"], w["Pas"]["std"] + 1e-8
+        sv_mean,  sv_std  = 0.0, w["Vlv"]["std"] + 1e-8   # legacy: sv / vlv_std
+        hr_mean,  hr_std  = p["HR"]["mean"],  p["HR"]["std"]  + 1e-8
+        log("Real beats: using sim norm_stats for normalisation (legacy)")
 
     beats = []
     for fpath in sorted(data_dir.glob("*.h5")):
@@ -180,7 +197,7 @@ def load_real_beats(data_dir: Path, stats: dict, log) -> torch.Tensor:
                     (map_ - pas_mean) / pas_std,
                     (sbp  - pas_mean) / pas_std,
                     (dbp  - pas_mean) / pas_std,
-                    sv    / vlv_std,
+                    (sv   - sv_mean)  / sv_std,
                     (hr   - hr_mean)  / hr_std,
                 ], dtype=torch.float32)
                 beats.append(torch.cat([wt.reshape(-1), sc]))
@@ -222,6 +239,9 @@ def main():
     # Data
     parser.add_argument("--sim-data-root",   required=True)
     parser.add_argument("--real-data",       required=True)
+    parser.add_argument("--real-norm-stats", default=None,
+                        help="Path to real_norm_stats.json; if provided, real patient inputs "
+                             "are z-scored with real-data statistics instead of sim statistics")
     parser.add_argument("--manifest-train",  default="manifest_train.json",
                         help="Manifest filename under sim-data-root (default: manifest_train.json)")
     parser.add_argument("--n-sims",          type=int, default=None)
@@ -330,8 +350,13 @@ def main():
         Path(args.sim_data_root) / "train", manifest, stats, n_sims, log
     )
 
+    real_stats = None
+    if args.real_norm_stats:
+        with open(args.real_norm_stats) as f:
+            real_stats = json.load(f)
+
     log("Loading real patient beats...")
-    real_beats = load_real_beats(Path(args.real_data), stats, log)
+    real_beats = load_real_beats(Path(args.real_data), stats, log, real_stats=real_stats)
 
     # ── Normalization sanity check ─────────────────────────────────────────────
     log(f"x_all      mean={x_all.mean():.4f}  std={x_all.std():.4f}  "
@@ -405,6 +430,7 @@ def main():
             n_real_beats=len(real_beats),
             sim_data_root=args.sim_data_root,
             real_data=args.real_data,
+            real_norm_stats=args.real_norm_stats,
         ),
         schedule=dict(
             flow_end=flow_end, enc_end=enc_end,

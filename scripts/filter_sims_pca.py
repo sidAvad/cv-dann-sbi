@@ -45,13 +45,22 @@ def load_sim_waveforms(data_dir: Path, index: list, stats: dict, n: int) -> np.n
     return np.concatenate(parts, axis=0)
 
 
-def load_real_waveforms(real_data_path: Path) -> np.ndarray:
-    """Load real patient waveforms (first 804 dims of real_beats tensor)."""
-    wave_len = len(WAVE_KEYS_REDUCED) * T  # 804
-    beats = torch.load(real_data_path, map_location="cpu", weights_only=False)
-    if isinstance(beats, dict):
-        beats = beats["x"]
-    return beats[:, :wave_len].float().numpy()
+def load_real_waveforms(real_data_path: Path, stats: dict) -> np.ndarray:
+    """Load z-scored Prv/Pra/Pvp/Pap waveforms from per-patient H5 files. Returns (N, 4*T)."""
+    import h5py
+    w = stats["waves"]
+    wave_mean = np.array([w[k]["mean"] for k in WAVE_KEYS_REDUCED], dtype=np.float32)[:, None]
+    wave_std  = np.array([w[k]["std"]  for k in WAVE_KEYS_REDUCED], dtype=np.float32)[:, None] + 1e-8
+    parts = []
+    for fpath in sorted(real_data_path.glob("*.h5")):
+        with h5py.File(fpath, "r") as f:
+            beat_keys = sorted(k for k in f.keys() if k.startswith("beat_"))
+            if not beat_keys:
+                continue
+            g = f[beat_keys[0]]
+            waves = np.stack([g[f"waves/{k}"][:].astype(np.float32) for k in WAVE_KEYS_REDUCED])
+            parts.append(((waves - wave_mean) / wave_std).reshape(-1))
+    return np.stack(parts)  # (N_patients, 4*T)
 
 
 def main():
@@ -87,7 +96,7 @@ def main():
 
     # ── Load real patient waveforms ───────────────────────────────────────────
     print(f"\nLoading real patient waveforms from {args.real_data}...")
-    X_real = load_real_waveforms(Path(args.real_data))
+    X_real = load_real_waveforms(Path(args.real_data), stats)
     print(f"Real waveforms: {X_real.shape}")
 
     # ── Fit PCA on random subsample of sims ───────────────────────────────────
