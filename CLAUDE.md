@@ -37,14 +37,24 @@ Forked from `cv-inverse-autoencoder` (the surrogate training repo).
 Joint training runs: `{type}-v{version}_{encoder-type}_dann_{objective}`
 
 - `type`: `exp` (full run) or `dry` (512 sims, smoke test)
-- `v{version}`: version string — use integers for major variants (`v1`, `v2`), decimals for minor tweaks (`v1.1`, `v1.2`); stored verbatim in `run_info_v{version}.json` as `"version": "1.1"`
+- `v{version}`: version string — stored verbatim in `run_info_v{version}.json` as `"version": "3b"`
 - `encoder-type`: `encoder-lipschitz` or `encoder-vae`
 - `dann`: always present — all train_joint.py runs use domain adversarial training
 - `objective`: `flow-maf5`, `flow-nsf8`, or `reconstruction`
 
+### Version numbering convention
+
+- **Major digit**: big architectural changes (v1 → v2 → v3)
+- **Sequential sub-versions** (`.1`, `.2`, `.3`): front-to-back increments within a major version (scale, hyperparams, data changes)
+- **Side variants** (`b`, `c`, `d`): lateral experiments branching off a base version, after the implicit `a`
+- **Implicit `.0` and `a`**: `v3` = `v3.0`; `v3.1` = `v3.1a`. The `.0` and `a` suffixes are never written.
+- **Explicit thereafter**: `v3b`, `v3.2c`, `v3d`, etc. — always write the letter/decimal explicitly after the first.
+
 Examples:
 - `exp-v1_encoder-lipschitz_dann_flow-maf5`
 - `exp-v1.1_encoder-lipschitz_dann_flow-maf5`
+- `exp-v3b_encoder-lipschitz_dann_flow-maf5`    ← side variant of v3
+- `exp-v3.2c_encoder-lipschitz_dann_flow-maf5`  ← side variant c of v3.2
 - `exp-v1_encoder-lipschitz_dann_reconstruction`
 - `exp-v1_encoder-vae_dann_flow-maf5`
 - `dry-v1_encoder-lipschitz_dann_flow-maf5`

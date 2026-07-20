@@ -52,10 +52,10 @@ directly comparable to v3 for first 100 epochs then keeps climbing; ~150 epochs 
 | # | Change | Run name | Status |
 |---|--------|----------|--------|
 | 3.2 | 1M sims, λ=2, 400-ep ramp, 600 ep | `exp-v3.2_encoder-lipschitz_dann_flow-maf5` | done — task=-1.70, w1=0.38 at ep600; real patient eval pending (run `v3-series_real-patient-alignment.ipynb`) |
-| 3.3 | 300k sims subsetted to PCA-nearest to reals, λ=0.5, 100-ep ramp | `exp-v3.3_encoder-lipschitz_dann_flow-maf5` | pending — pca_filter running on adamant |
-| 3.05 | 300k sims, λ=0.5, 100-ep ramp, real inputs z-scored with real stats | `exp-v3.05_encoder-lipschitz_dann_flow-maf5` | queued |
+| 3.3 | 300k sims subsetted to PCA-nearest to reals, λ=0.5, 100-ep ramp | `exp-v3.3_encoder-lipschitz_dann_flow-maf5` | pending — manifest ready, waiting on v3b results before launching |
+| 3b | 300k sims, λ=0.5, 100-ep ramp, real inputs z-scored with real stats | `exp-v3b_encoder-lipschitz_dann_flow-maf5` | queued |
 
-### v3.05 — real-data normalisation
+### v3b — real-data normalisation
 
 **Hypothesis**: in v3, both sim and real patient inputs are z-scored with sim-derived statistics
 (`norm_stats.json`). Real patients are systematically shifted from sims at the raw input level —
