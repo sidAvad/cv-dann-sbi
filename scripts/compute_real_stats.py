@@ -4,6 +4,9 @@ Compute per-channel mean/std from real patient H5 files and save as real_norm_st
 These stats are used to z-score real patient inputs independently of the sim distribution,
 so both domains arrive at the encoder with ~zero mean and ~unit variance in their own space.
 
+Scalars computed separately per summary type (map/sbp/dbp/sv/hr) so that zscore mode
+can normalize each independently — matching the sim-side compute_scalar_stats.py approach.
+
 Usage:
     python scripts/compute_real_stats.py \
         --real-data /home/sa4604/real_data/onebeat_300patients \
@@ -35,11 +38,8 @@ def main():
     assert h5_files, f"No H5 files found in {data_dir}"
     print(f"Found {len(h5_files)} patient files")
 
-    # Accumulators: waveforms (per channel), Pas scalars, SV, HR
-    wave_vals  = {k: [] for k in WAVE_KEYS_REAL}
-    pas_vals   = []   # map, sbp, dbp all drawn from the same Pas distribution
-    sv_vals    = []
-    hr_vals    = []
+    wave_vals = {k: [] for k in WAVE_KEYS_REAL}
+    map_vals, sbp_vals, dbp_vals, sv_vals, hr_vals = [], [], [], [], []
 
     for fpath in h5_files:
         with h5py.File(fpath, "r") as f:
@@ -49,31 +49,32 @@ def main():
                 g = f[key]
                 for ch in WAVE_KEYS_REAL:
                     wave_vals[ch].append(g[f"waves/{ch}"][:].astype(np.float32))
-                pas_vals.extend([
-                    float(g["summaries/map"][()]),
-                    float(g["summaries/sbp"][()]),
-                    float(g["summaries/dbp"][()]),
-                ])
+                map_vals.append(float(g["summaries/map"][()]))
+                sbp_vals.append(float(g["summaries/sbp"][()]))
+                dbp_vals.append(float(g["summaries/dbp"][()]))
                 sv_vals.append(float(g["summaries/sv"][()]))
                 hr_vals.append(float(g["parameters/HR"][()]))
 
     out = {"waves": {}, "scalars": {}}
 
+    print("\nWaveform stats:")
     for ch in WAVE_KEYS_REAL:
         arr = np.concatenate(wave_vals[ch])
         out["waves"][ch] = {"mean": float(arr.mean()), "std": float(arr.std())}
         print(f"  {ch:<6}  mean={arr.mean():.4f}  std={arr.std():.4f}")
 
-    pas_arr = np.array(pas_vals)
-    out["scalars"]["Pas"]  = {"mean": float(pas_arr.mean()), "std": float(pas_arr.std())}
-    sv_arr  = np.array(sv_vals)
-    out["scalars"]["sv"]   = {"mean": float(sv_arr.mean()),  "std": float(sv_arr.std())}
-    hr_arr  = np.array(hr_vals)
-    out["scalars"]["HR"]   = {"mean": float(hr_arr.mean()),  "std": float(hr_arr.std())}
+    scalar_data = {
+        "map": np.array(map_vals),
+        "sbp": np.array(sbp_vals),
+        "dbp": np.array(dbp_vals),
+        "sv":  np.array(sv_vals),
+        "hr":  np.array(hr_vals),
+    }
 
-    print(f"\n  Pas    mean={pas_arr.mean():.4f}  std={pas_arr.std():.4f}")
-    print(f"  SV     mean={sv_arr.mean():.4f}   std={sv_arr.std():.4f}")
-    print(f"  HR     mean={hr_arr.mean():.4f}   std={hr_arr.std():.4f}")
+    print("\nScalar stats:")
+    for key, arr in scalar_data.items():
+        out["scalars"][key] = {"mean": float(arr.mean()), "std": float(arr.std())}
+        print(f"  {key:<6}  mean={arr.mean():.4f}  std={arr.std():.4f}")
 
     out_path = Path(args.out)
     with open(out_path, "w") as f:

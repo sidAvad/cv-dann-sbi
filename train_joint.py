@@ -135,9 +135,10 @@ def gradient_penalty(critic: nn.Module, z_sim: torch.Tensor,
 # ─── Data loading ─────────────────────────────────────────────────────────────
 
 def load_sim_data(data_dir: Path, manifest: dict, stats: dict, n: int, log,
-                  include_sv: bool = True):
+                  include_sv: bool = True, scalar_norm: str = "legacy"):
     index   = manifest["index"][:n]
-    dataset = ReducedCVDataset(str(data_dir), index, stats, include_sv=include_sv)
+    dataset = ReducedCVDataset(str(data_dir), index, stats,
+                               include_sv=include_sv, scalar_norm=scalar_norm)
     loader  = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
     thetas, xs, loaded = [], [], 0
     for theta_b, x_b in loader:
@@ -155,31 +156,42 @@ def load_sim_data(data_dir: Path, manifest: dict, stats: dict, n: int, log,
 
 def load_real_beats(data_dir: Path, stats: dict, log,
                     real_stats: dict | None = None,
-                    include_sv: bool = True) -> torch.Tensor:
+                    include_sv: bool = True,
+                    scalar_norm: str = "legacy") -> torch.Tensor:
     """Load all patient beats into a flat tensor (N_beats, OBS_DIM).
 
-    If real_stats is provided (from real_norm_stats.json), use it to z-score
-    real patient waveforms and scalars instead of the sim-derived stats.
+    scalar_norm="legacy"  — waveform-level Pas stats for MAP/SBP/DBP; sv/vlv_std for SV
+    scalar_norm="zscore"  — per-summary distribution stats from real_stats["scalars"]
+                            (real_stats must be provided)
     """
-    # Wave and scalar normalization constants — prefer real stats if provided
+    w = stats["waves"]
+    p = stats["parameters"]
+
+    # Waveform normalization: use real stats if provided, else sim stats
     if real_stats is not None:
         rw = real_stats["waves"]
-        rs = real_stats["scalars"]
         wave_mean = torch.tensor([rw[k]["mean"] for k in WAVE_KEYS_REAL], dtype=torch.float32).unsqueeze(1)
         wave_std  = torch.tensor([rw[k]["std"]  for k in WAVE_KEYS_REAL], dtype=torch.float32).unsqueeze(1)
-        pas_mean, pas_std = rs["Pas"]["mean"], rs["Pas"]["std"] + 1e-8
-        sv_mean,  sv_std  = rs["sv"]["mean"],  rs["sv"]["std"]  + 1e-8
-        hr_mean,  hr_std  = rs["HR"]["mean"],  rs["HR"]["std"]  + 1e-8
-        log("Real beats: using real_norm_stats for normalisation")
+        log("Real beats: using real_norm_stats for waveform normalisation")
     else:
-        w = stats["waves"]
-        p = stats["parameters"]
         wave_mean = torch.tensor([w[k]["mean"] for k in WAVE_KEYS_REAL], dtype=torch.float32).unsqueeze(1)
         wave_std  = torch.tensor([w[k]["std"]  for k in WAVE_KEYS_REAL], dtype=torch.float32).unsqueeze(1)
-        pas_mean, pas_std = w["Pas"]["mean"], w["Pas"]["std"] + 1e-8
-        sv_mean,  sv_std  = 0.0, w["Vlv"]["std"] + 1e-8   # legacy: sv / vlv_std
-        hr_mean,  hr_std  = p["HR"]["mean"],  p["HR"]["std"]  + 1e-8
         log("Real beats: using sim norm_stats for normalisation (legacy)")
+
+    # Scalar normalization
+    if scalar_norm == "zscore":
+        rs = real_stats["scalars"]
+        map_mean, map_std = rs["map"]["mean"], rs["map"]["std"] + 1e-8
+        sbp_mean, sbp_std = rs["sbp"]["mean"], rs["sbp"]["std"] + 1e-8
+        dbp_mean, dbp_std = rs["dbp"]["mean"], rs["dbp"]["std"] + 1e-8
+        sv_mean,  sv_std  = rs["sv"]["mean"],  rs["sv"]["std"]  + 1e-8
+        hr_mean,  hr_std  = rs["hr"]["mean"],  rs["hr"]["std"]  + 1e-8
+        log("Real beats: using zscore scalar normalisation from real_norm_stats")
+    else:
+        map_mean = sbp_mean = dbp_mean = w["Pas"]["mean"]
+        map_std  = sbp_std  = dbp_std  = w["Pas"]["std"] + 1e-8
+        sv_mean,  sv_std  = 0.0, w["Vlv"]["std"] + 1e-8
+        hr_mean,  hr_std  = p["HR"]["mean"], p["HR"]["std"] + 1e-8
 
     beats = []
     for fpath in sorted(data_dir.glob("*.h5")):
@@ -196,9 +208,9 @@ def load_real_beats(data_dir: Path, stats: dict, log,
                 sv    = float(g["summaries/sv"][()])
                 hr    = float(g["parameters/HR"][()])
                 sc_vals = [
-                    (map_ - pas_mean) / pas_std,
-                    (sbp  - pas_mean) / pas_std,
-                    (dbp  - pas_mean) / pas_std,
+                    (map_ - map_mean) / map_std,
+                    (sbp  - sbp_mean) / sbp_std,
+                    (dbp  - dbp_mean) / dbp_std,
                 ]
                 if include_sv:
                     sc_vals.append((sv - sv_mean) / sv_std)
@@ -244,8 +256,12 @@ def main():
     parser.add_argument("--sim-data-root",   required=True)
     parser.add_argument("--real-data",       required=True)
     parser.add_argument("--real-norm-stats", default=None,
-                        help="Path to real_norm_stats.json; if provided, real patient inputs "
+                        help="Path to real_norm_stats.json; if provided, real patient waveforms "
                              "are z-scored with real-data statistics instead of sim statistics")
+    parser.add_argument("--scalar-norm", choices=["legacy", "zscore"], default="legacy",
+                        help="Scalar normalization mode: legacy=waveform-derived stats, "
+                             "zscore=per-summary distribution stats (requires norm_stats[scalars] "
+                             "for sims and real_norm_stats[scalars] for reals)")
     parser.add_argument("--no-sv", action="store_true",
                         help="Drop SV scalar from observation (808-dim instead of 809-dim)")
     parser.add_argument("--manifest-train",  default="manifest_train.json",
@@ -351,11 +367,12 @@ def main():
     stats    = load_stats(STATS_PATH)
     manifest = load_manifest(Path(args.sim_data_root) / args.manifest_train)
 
-    include_sv = not args.no_sv
+    include_sv  = not args.no_sv
+    scalar_norm = args.scalar_norm
     log(f"Loading {n_sims} sim observations...")
     theta_all, x_all = load_sim_data(
         Path(args.sim_data_root) / "train", manifest, stats, n_sims, log,
-        include_sv=include_sv,
+        include_sv=include_sv, scalar_norm=scalar_norm,
     )
 
     real_stats = None
@@ -365,7 +382,7 @@ def main():
 
     log("Loading real patient beats...")
     real_beats = load_real_beats(Path(args.real_data), stats, log, real_stats=real_stats,
-                                 include_sv=include_sv)
+                                 include_sv=include_sv, scalar_norm=scalar_norm)
 
     # ── Normalization sanity check ─────────────────────────────────────────────
     log(f"x_all      mean={x_all.mean():.4f}  std={x_all.std():.4f}  "
@@ -441,6 +458,7 @@ def main():
             sim_data_root=args.sim_data_root,
             real_data=args.real_data,
             real_norm_stats=args.real_norm_stats,
+            scalar_norm=args.scalar_norm,
             no_sv=args.no_sv,
         ),
         schedule=dict(

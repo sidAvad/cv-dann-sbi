@@ -152,13 +152,20 @@ class ReducedCVDataset(Dataset):
       theta_infer : (24,)  — all params except HR
       x_reduced   : (809,) — 4 z-scored waveforms (4*201) + 5 scalars
                              scalars: Pas mean, Pas max, Pas min, SV, HR_z
+
+    scalar_norm:
+      "legacy"  — z-score Pas summaries via the waveform-level Pas stats; SV via vlv_std (default)
+      "zscore"  — z-score each scalar using its own distribution across sims
+                  (requires stats["scalars"] with map/sbp/dbp/sv/hr entries)
     """
 
-    def __init__(self, data_dir, index_entries, stats, include_sv: bool = True):
+    def __init__(self, data_dir, index_entries, stats,
+                 include_sv: bool = True, scalar_norm: str = "legacy"):
         self.data_dir   = data_dir
         self.index      = index_entries
         self._handles   = {}
         self.include_sv = include_sv
+        self.scalar_norm = scalar_norm
 
         w = stats["waves"]
         p = stats["parameters"]
@@ -171,15 +178,18 @@ class ReducedCVDataset(Dataset):
             [w[k]["std"] for k in WAVE_KEYS_REDUCED], dtype=torch.float32
         ).unsqueeze(1)
 
-        # Z-score scalars for Pas and Vlv (used to compute scalars)
-        self._pas_mean = w["Pas"]["mean"]
-        self._pas_std  = w["Pas"]["std"] + 1e-8
-        self._vlv_mean = w["Vlv"]["mean"]
-        self._vlv_std  = w["Vlv"]["std"] + 1e-8
-
-        # Z-score for HR (from parameter stats)
-        self._hr_mean = p["HR"]["mean"]
-        self._hr_std  = p["HR"]["std"] + 1e-8
+        if scalar_norm == "zscore":
+            sc = stats["scalars"]
+            self._map_mean = sc["map"]["mean"];  self._map_std = sc["map"]["std"] + 1e-8
+            self._sbp_mean = sc["sbp"]["mean"];  self._sbp_std = sc["sbp"]["std"] + 1e-8
+            self._dbp_mean = sc["dbp"]["mean"];  self._dbp_std = sc["dbp"]["std"] + 1e-8
+            self._sv_mean  = sc["sv"]["mean"];   self._sv_std  = sc["sv"]["std"]  + 1e-8
+            self._hr_mean  = sc["hr"]["mean"];   self._hr_std  = sc["hr"]["std"]  + 1e-8
+        else:
+            # legacy: z-score Pas waveform first, then take summary; SV via vlv_std
+            self._pas_mean = w["Pas"]["mean"];  self._pas_std = w["Pas"]["std"] + 1e-8
+            self._vlv_mean = w["Vlv"]["mean"];  self._vlv_std = w["Vlv"]["std"] + 1e-8
+            self._hr_mean  = p["HR"]["mean"];   self._hr_std  = p["HR"]["std"]  + 1e-8
 
     def __len__(self):
         return len(self.index)
@@ -205,23 +215,33 @@ class ReducedCVDataset(Dataset):
         )
         waves = (waves - self.wave_mean) / (self.wave_std + 1e-8)  # (4, 201)
 
-        # Scalars from Pas (z-scored waveform)
-        pas_z = torch.from_numpy(g["waves/Pas"][:].astype(np.float32))
-        pas_z = (pas_z - self._pas_mean) / self._pas_std
-        pas_mean = pas_z.mean()
-        pas_max  = pas_z.max()
-        pas_min  = pas_z.min()
-
         # HR z-scored
         hr_z = torch.tensor((hr_raw - self._hr_mean) / self._hr_std, dtype=torch.float32)
 
-        if self.include_sv:
-            vlv_z = torch.from_numpy(g["waves/Vlv"][:].astype(np.float32))
-            vlv_z = (vlv_z - self._vlv_mean) / self._vlv_std
-            sv = vlv_z.max() - vlv_z.min()
-            scalars = torch.stack([pas_mean, pas_max, pas_min, sv, hr_z])  # (5,)
+        if self.scalar_norm == "zscore":
+            pas = g["waves/Pas"][:].astype(np.float32)
+            map_z = torch.tensor((pas.mean() - self._map_mean) / self._map_std, dtype=torch.float32)
+            sbp_z = torch.tensor((pas.max()  - self._sbp_mean) / self._sbp_std, dtype=torch.float32)
+            dbp_z = torch.tensor((pas.min()  - self._dbp_mean) / self._dbp_std, dtype=torch.float32)
+            if self.include_sv:
+                vlv = g["waves/Vlv"][:].astype(np.float32)
+                sv_z = torch.tensor(
+                    ((vlv.max() - vlv.min()) - self._sv_mean) / self._sv_std, dtype=torch.float32
+                )
+                scalars = torch.stack([map_z, sbp_z, dbp_z, sv_z, hr_z])  # (5,)
+            else:
+                scalars = torch.stack([map_z, sbp_z, dbp_z, hr_z])         # (4,)
         else:
-            scalars = torch.stack([pas_mean, pas_max, pas_min, hr_z])      # (4,)
+            # legacy
+            pas_z = torch.from_numpy(g["waves/Pas"][:].astype(np.float32))
+            pas_z = (pas_z - self._pas_mean) / self._pas_std
+            if self.include_sv:
+                vlv_z = torch.from_numpy(g["waves/Vlv"][:].astype(np.float32))
+                vlv_z = (vlv_z - self._vlv_mean) / self._vlv_std
+                sv = vlv_z.max() - vlv_z.min()
+                scalars = torch.stack([pas_z.mean(), pas_z.max(), pas_z.min(), sv, hr_z])  # (5,)
+            else:
+                scalars = torch.stack([pas_z.mean(), pas_z.max(), pas_z.min(), hr_z])      # (4,)
 
         x = torch.cat([waves.reshape(-1), scalars])  # (809,) or (808,)
 
