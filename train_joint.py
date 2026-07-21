@@ -52,7 +52,7 @@ from sbi.neural_nets import posterior_nn
 
 from dataset import (
     ReducedCVDataset, PARAM_KEYS_INFER,
-    N_REDUCED_CHANNELS, T,
+    N_REDUCED_CHANNELS, N_SCALARS, T,
     load_stats, load_manifest,
 )
 from models import (
