@@ -14,6 +14,12 @@ Usage:
   python scripts/compute_scalar_stats.py \
       --data-root /media/local/SimData/hdf5/cv8/simset_10M_cv8Eed_20260314 \
       --n-sims 300000
+
+  # PCA-nearest subset:
+  python scripts/compute_scalar_stats.py \
+      --data-root /media/local/SimData/hdf5/cv8/simset_10M_cv8Eed_20260314 \
+      --manifest /home/sa4604/cv-dann-sbi/manifest_train_v3.3.json \
+      --stats-path norm_stats_v3c.json
 """
 
 import argparse
@@ -28,13 +34,15 @@ import numpy as np
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data-root", required=True)
+    p.add_argument("--manifest", default=None,
+                   help="Path to manifest JSON (default: <data-root>/manifest_train.json)")
     p.add_argument("--stats-path", default="norm_stats.json")
     p.add_argument("--n-sims", type=int, default=None,
                    help="Number of sims to use (default: all in manifest)")
     args = p.parse_args()
 
     data_root = Path(args.data_root)
-    manifest_path = data_root / "manifest_train.json"
+    manifest_path = Path(args.manifest) if args.manifest else data_root / "manifest_train.json"
     with open(manifest_path) as f:
         manifest = json.load(f)
 

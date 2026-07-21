@@ -255,6 +255,8 @@ def main():
     # Data
     parser.add_argument("--sim-data-root",   required=True)
     parser.add_argument("--real-data",       required=True)
+    parser.add_argument("--stats-path", default="norm_stats.json",
+                        help="Path to sim norm_stats.json (default: norm_stats.json)")
     parser.add_argument("--real-norm-stats", default=None,
                         help="Path to real_norm_stats.json; if provided, real patient waveforms "
                              "are z-scored with real-data statistics instead of sim statistics")
@@ -364,7 +366,7 @@ def main():
         + (f"  kl_weight={args.kl_weight}" if args.encoder_type == "vae" else ""))
 
     # ── Load data ──────────────────────────────────────────────────────────────
-    stats    = load_stats(STATS_PATH)
+    stats    = load_stats(Path(args.stats_path))
     manifest = load_manifest(Path(args.sim_data_root) / args.manifest_train)
 
     include_sv  = not args.no_sv
