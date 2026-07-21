@@ -52,16 +52,17 @@ directly comparable to v3 for first 100 epochs then keeps climbing; ~150 epochs 
 | # | Change | Run name | Status |
 |---|--------|----------|--------|
 | 3.2 | 1M sims, λ=2, 400-ep ramp, 600 ep | `exp-v3.2_encoder-lipschitz_dann_flow-maf5` | done — task=-1.70, w1=0.38 at ep600; real patient eval pending (run `v3-series_real-patient-alignment.ipynb`) |
-| 3b | 300k sims, λ=0.5, 100-ep ramp, real inputs z-scored with real stats | `exp-v3b_encoder-lipschitz_dann_flow-maf5` | queued |
-| 3c | PCA-nearest 300k sims + real norm stats, λ=0.5, 100-ep ramp | `exp-v3c_encoder-lipschitz_dann_flow-maf5` | queued — pending v3b results |
+| 3_nosv | 300k sims, no SV scalar (808-dim), legacy norm | `exp-v3_nosv_encoder-lipschitz_dann_flow-maf5` | done — task=14.02, w1=0.84 |
+| 3b | 300k sims, λ=0.5, 100-ep ramp, real inputs z-scored with real stats | `exp-v3b_encoder-lipschitz_dann_flow-maf5` | done — task=13.03, w1=0.760 |
+| 3c | PCA-nearest 300k sims + real norm stats + v3c scalar stats, λ=0.5, 100-ep ramp | `exp-v3c_encoder-lipschitz_dann_flow-maf5` | running |
 
-### v3b — real-data normalisation
+**v3b finding**: task=13.03 (near v3's 12.84), but W1=0.760 vs v3's 0.853 — better domain alignment. Proper scalar normalization (zscore mode) removes input-level scale mismatch before WDGRL, so adversarial budget goes to residual distributional differences only.
 
-**Hypothesis**: in v3, both sim and real patient inputs are z-scored with sim-derived statistics
-(`norm_stats.json`). Real patients are systematically shifted from sims at the raw input level —
-WDGRL has to compensate for both distributional shift *and* the mean offset simultaneously.
-Z-scoring reals with their own statistics removes the mean/scale mismatch before the encoder sees
-anything, leaving WDGRL to handle only the residual shape and correlation differences.
+**v3_nosv finding**: task=14.02 (worse than v3 as expected without SV info). SV ablation shows 1NN proxy massively better than direct inference for SV recovery — residual domain gap shifts posterior means for volume parameters. Posterior means differ between direct/1NN with comparable stds → flow is conditioned OOD for volume params, not decoder brittleness. Affects Vrv/Vlv volume parameters most; pressure/resistance params (SVR, PVR, Ras, Rap) work well on reals.
+
+### v3b — real-data normalisation (DONE)
+
+**Result**: task=13.03, w1=0.760. W1 lower than v3 (0.853) confirming better alignment. Scalar zscore normalization implemented: each summary (MAP, SBP, DBP, SV, HR) z-scored using its own cross-sim (or cross-real) distribution. Sim stats in `norm_stats.json["scalars"]`, real stats in `real_norm_stats.json["scalars"]`.
 
 **Domain gap at input level** (real mean − sim mean, in sim σ units):
 
@@ -84,17 +85,23 @@ possible comparison.
 by `scripts/compute_real_stats.py` and saved to `real_norm_stats.json` (not committed — generated on
 adamant from the 802 real patient H5 files).
 
-### v3c — PCA-nearest sim subset + real norm stats
+### v3c — PCA-nearest sim subset + real norm stats (RUNNING)
 
-**Hypothesis**: combining both input-level fixes — filter to the 300k sims nearest the real patients in PCA space (reducing sim/real support mismatch) and z-score real inputs with real stats (removing the systematic mean/scale offset). WDGRL then only needs to handle residual distributional differences, not structural gaps in support or scaling. Gates on v3b results confirming the normalization fix helps.
+**Hypothesis**: PCA-nearest 300k sims (waveform-shape nearest to reals) + real stats normalization + v3c-specific scalar stats. WDGRL handles only residual distributional differences.
 
-**Implementation**: same PCA-nearest manifest as planned for v3.3 (already computed) + `--real-norm-stats real_norm_stats.json`, all other hyperparams identical to v3/v3b (λ=0.5, 100-ep ramp, 400 epochs).
+**Key detail**: scalar stats for v3c computed from the PCA-nearest 300k subset (`norm_stats_v3c.json`), not the full sim pool — their distributions differ (e.g. map=71.5 vs 76.2 for full 300k).
 
----
-
-### Future: proper scalar normalisation
-
-Currently Pas scalars (mean/max/min) for sims are derived by z-scoring the Pas waveform then taking mean/max/min — equivalent to `(MAP - µ_wave) / σ_wave` where σ_wave includes within-beat pulsatile variation, not just between-sim variation. The right approach for all 5 scalars is: extract one summary per sim/real (MAP, SBP, DBP, SV, HR), then z-score using the distribution of that summary across sims (for sims) or across reals (for reals). Requires computing sim scalar stats (MAP/SBP/DBP/SV mean/std across sims) and storing in `norm_stats.json["scalars"]`, with a `--scalar-norm zscore` flag for backward compatibility.
+**Command**:
+```bash
+python train_joint.py --run exp-v3c_encoder-lipschitz_dann_flow-maf5 --version 3c \
+  --objective flow-maf5 \
+  --sim-data-root /media/local/SimData/hdf5/cv8/simset_10M_cv8Eed_20260314 \
+  --manifest-train /home/sa4604/cv-dann-sbi/manifest_train_v3.3.json \
+  --stats-path /home/sa4604/cv-dann-sbi/norm_stats_v3c.json \
+  --real-data /home/sa4604/real_data/onebeat_300patients --n-sims 300000 \
+  --lambda-target 0.5 --lambda-warmup 100 --use-mixup --max-epochs 400 \
+  --scalar-norm zscore --real-norm-stats /home/sa4604/cv-dann-sbi/real_norm_stats.json
+```
 
 ---
 
