@@ -20,8 +20,7 @@ Simulation-based inference (SBI) over cardiovascular physiology. Given 4 right-h
 | File | Purpose |
 |------|---------|
 | `norm_stats.json` | Wave + parameter stats from full sim pool |
-| `norm_stats_v3c.json` | Wave stats (same) + scalar stats from PCA-nearest 300k subset |
-| `real_norm_stats.json` | Per-channel wave stats + scalar stats from 802 real patients |
+| `norm_stats_v3c.json` | Wave + parameter stats from PCA-nearest 300k subset |
 | `manifest_train_v3.3.json` | PCA-nearest 300k sim manifest (50-PC waveform PCA, 1M pool) |
 | `real_data/onebeat_300patients/` | 802 real patient H5 files |
 
@@ -60,8 +59,8 @@ Simulation-based inference (SBI) over cardiovascular physiology. Given 4 right-h
 | `exp-v3.1_encoder-lipschitz_dann_flow-maf5` | done | task=-3.13, w1=0.57 — worse on reals (over-sharp posteriors) |
 | `exp-v3.2_encoder-lipschitz_dann_flow-maf5` | done | task=-1.70, w1=0.38 |
 | `exp-v3_nosv_encoder-lipschitz_dann_flow-maf5` | done | task=14.02, w1=0.84 — 808-dim, no SV scalar |
-| `exp-v3b_encoder-lipschitz_dann_flow-maf5` | done | task=13.03, w1=0.760 — real input zscore norm, better alignment |
-| `exp-v3c_encoder-lipschitz_dann_flow-maf5` | running | PCA-nearest 300k + real norm stats + v3c scalar stats |
+| `exp-v3b_encoder-lipschitz_dann_flow-maf5` | done | task=13.03, w1=0.760 — zscore norm, worse than v3 |
+| `exp-v3c_encoder-lipschitz_dann_flow-maf5` | done | task=10.19, w1=1.00 — not better than v3 on reals |
 
 **Key finding**: 1NN proxy inference massively better than direct inference for SV recovery. Posterior means differ between direct/1NN with comparable stds → residual domain gap shifts volume-parameter posteriors OOD. Pressure/resistance params (SVR, PVR, Ras, Rap) work well on reals; volume params (Vrv/Vlv SV) do not.
 
@@ -69,12 +68,17 @@ Simulation-based inference (SBI) over cardiovascular physiology. Given 4 right-h
 
 ```
 --stats-path PATH          sim norm_stats JSON (default: norm_stats.json)
---real-norm-stats PATH     real patient norm stats JSON; enables real-side zscore
---scalar-norm {legacy,zscore}  zscore = per-summary distribution stats (v3b+)
 --manifest-train PATH      manifest JSON (absolute path or relative to sim-data-root)
 --no-sv                    drop SV scalar → 808-dim observation
 --n-sims N                 number of sims to load (default: N_SIMS_FULL=100k; always set explicitly)
 ```
+
+## Versioning and branching convention
+
+- **Version numbers** are assigned only when a run survives evaluation and is merged to `main`. They are hard-earned: minor improvements earn `.1`/`.2`, architectural changes earn a new major (v4, v5).
+- **Git branches** (`exp/<what-you're-testing>`) are used for any change that requires new code, not just hyperparameters. If reverting requires more than deleting a flag, it's a branch. Abandoned branches are tombstones — do not merge.
+- Pure hyperparameter variants (n-sims, epochs, λ) commit directly to `main`; the run name is the record.
+- Planned branches: `exp/lip-flow-dann-reconstruct` (reconstruction objective), `exp/spin` (domain translation — likely a separate repo).
 
 ## Git conventions
 

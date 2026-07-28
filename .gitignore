@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 norm_stats.json
+norm_stats_v3c.json
+manifest_train_v3.3.json
 dry-runs/
 outputs/
 sbi-logs/

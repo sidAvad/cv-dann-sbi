@@ -53,43 +53,16 @@ directly comparable to v3 for first 100 epochs then keeps climbing; ~150 epochs 
 |---|--------|----------|--------|
 | 3.2 | 1M sims, λ=2, 400-ep ramp, 600 ep | `exp-v3.2_encoder-lipschitz_dann_flow-maf5` | done — task=-1.70, w1=0.38 at ep600; real patient eval pending (run `v3-series_real-patient-alignment.ipynb`) |
 | 3_nosv | 300k sims, no SV scalar (808-dim), legacy norm | `exp-v3_nosv_encoder-lipschitz_dann_flow-maf5` | done — task=14.02, w1=0.84 |
-| 3b | 300k sims, λ=0.5, 100-ep ramp, real inputs z-scored with real stats | `exp-v3b_encoder-lipschitz_dann_flow-maf5` | done — task=13.03, w1=0.760 |
-| 3c | PCA-nearest 300k sims + real norm stats + v3c scalar stats, λ=0.5, 100-ep ramp | `exp-v3c_encoder-lipschitz_dann_flow-maf5` | running |
+| 3b | 300k sims, λ=0.5, 100-ep ramp, zscore scalar norm (exp branch — abandoned) | `exp-v3b_encoder-lipschitz_dann_flow-maf5` | done — task=13.03, w1=0.760 — worse than v3 |
+| 3c | PCA-nearest 300k sims, legacy norm, λ=0.5, 100-ep ramp | `exp-v3c_encoder-lipschitz_dann_flow-maf5` | done — task=10.19, w1=1.00; not obviously better than v3 on reals |
 
-**v3b finding**: task=13.03 (near v3's 12.84), but W1=0.760 vs v3's 0.853 — better domain alignment. Proper scalar normalization (zscore mode) removes input-level scale mismatch before WDGRL, so adversarial budget goes to residual distributional differences only.
+**v3b finding (ABANDONED)**: task=13.03, W1=0.760 — worse than v3 overall. Zscore normalization using separate sim/real stats introduced a domain gap at the input level: the same physical measurement (e.g. SBP=120 mmHg) maps to different normalized values depending on which population's stats are used. Legacy normalization is correct because it uses the same constants for both sims and reals — same physical value → same input to the encoder.
 
 **v3_nosv finding**: task=14.02 (worse than v3 as expected without SV info). SV ablation shows 1NN proxy massively better than direct inference for SV recovery — residual domain gap shifts posterior means for volume parameters. Posterior means differ between direct/1NN with comparable stds → flow is conditioned OOD for volume params, not decoder brittleness. Affects Vrv/Vlv volume parameters most; pressure/resistance params (SVR, PVR, Ras, Rap) work well on reals.
 
-### v3b — real-data normalisation (DONE)
+### v3c — PCA-nearest sim subset, legacy norm (RUNNING)
 
-**Result**: task=13.03, w1=0.760. W1 lower than v3 (0.853) confirming better alignment. Scalar zscore normalization implemented: each summary (MAP, SBP, DBP, SV, HR) z-scored using its own cross-sim (or cross-real) distribution. Sim stats in `norm_stats.json["scalars"]`, real stats in `real_norm_stats.json["scalars"]`.
-
-**Domain gap at input level** (real mean − sim mean, in sim σ units):
-
-| Channel | Sim mean | Real mean | Sim std | Shift (sim σ) |
-|---------|----------|-----------|---------|---------------|
-| Prv | 19.7 | 27.0 | 20.4 | +0.36σ |
-| Pra | 8.2 | 8.5 | 7.1 | +0.04σ |
-| Pvp | 16.0 | 13.3 | 11.8 | −0.23σ |
-| Pap | 31.6 | 36.6 | 18.0 | +0.28σ |
-| Pas scalar | 76.1 | 102.6 | 27.6 | **+0.97σ** |
-| HR | 69.4 | 75.9 | 18.9 | +0.34σ |
-| SV (÷ Vlv_std) | — | 65.9 mL | Vlv_std=39.5 | scalar=1.67 vs ~1 |
-
-Pas is nearly 1σ shifted (real patients have much higher systemic pressures); SV scalar sits at 1.67
-when sims are centred near 1. With `real_norm_stats.json` all real inputs land near zero mean / unit
-variance in their own distribution. Same 300k sims, λ=0.5, 100-ep ramp, 400 epochs as v3 — cleanest
-possible comparison.
-
-**Implementation**: `--real-norm-stats real_norm_stats.json` flag in `train_joint.py`. Stats computed
-by `scripts/compute_real_stats.py` and saved to `real_norm_stats.json` (not committed — generated on
-adamant from the 802 real patient H5 files).
-
-### v3c — PCA-nearest sim subset + real norm stats (RUNNING)
-
-**Hypothesis**: PCA-nearest 300k sims (waveform-shape nearest to reals) + real stats normalization + v3c-specific scalar stats. WDGRL handles only residual distributional differences.
-
-**Key detail**: scalar stats for v3c computed from the PCA-nearest 300k subset (`norm_stats_v3c.json`), not the full sim pool — their distributions differ (e.g. map=71.5 vs 76.2 for full 300k).
+**Result**: task=10.19, w1=1.00. Better sim-side NLL than v3 (10.19 vs 12.84) but domain alignment plateaued at w1≈1.0 from ep270 onward — worse than v3's 0.85. Real patient results not obviously better. PCA selection tightened the training distribution but created a harder-to-align latent gap. **v3 remains best real-patient model. DANN approach at this scale appears to have hit its ceiling — moving to SPIN.**
 
 **Command**:
 ```bash
@@ -99,17 +72,8 @@ python train_joint.py --run exp-v3c_encoder-lipschitz_dann_flow-maf5 --version 3
   --manifest-train /home/sa4604/cv-dann-sbi/manifest_train_v3.3.json \
   --stats-path /home/sa4604/cv-dann-sbi/norm_stats_v3c.json \
   --real-data /home/sa4604/real_data/onebeat_300patients --n-sims 300000 \
-  --lambda-target 0.5 --lambda-warmup 100 --use-mixup --max-epochs 400 \
-  --scalar-norm zscore --real-norm-stats /home/sa4604/cv-dann-sbi/real_norm_stats.json
+  --lambda-target 0.5 --lambda-warmup 100 --use-mixup --max-epochs 400
 ```
-
----
-
-### v4 series — VAE encoder
-| # | Change | Run name | Status |
-|---|--------|----------|--------|
-| 4 | VAE encoder + WDGRL, 300k sims, λ=0.5, 100-ep ramp, kl=1e-4 | `exp-v4_encoder-vae_dann_flow-maf5` | done — task=9.57, w1=1.58 at ep400 (hit max); KL unregularized (kl_weight too small) |
-| 4.1 | VAE encoder, kl_weight=1e-2, 600 epochs | `exp-v4.1_encoder-vae_dann_flow-maf5` | done — task=3.34, w1=1.75 at ep600 (hit max); KL forced down (955→440), task improved vs v4 but W1 alignment worse; VAE series abandoned (see notes) |
 
 ## WDGRL implementation notes (v2+)
 
@@ -135,29 +99,22 @@ Three-phase schedule: flow-warmup (enc frozen) → enc-warmup (flow frozen, WDGR
 
 Per batch draw `batch_size` pairs `(i,j)` from 802 real beats, interpolate `x = α·x_i + (1-α)·x_j` with `α ~ Beta(0.4, 0.4)`, optionally add Gaussian noise (σ_wave≈0.03, σ_scalar≈0.01). Expands effective diversity from 802 to ~321k unique pairs per epoch.
 
+## Planned branches
+
+### exp/lip-flow-dann-reconstruct — reconstruction objective
+
+Replace the MAF5 flow with a reconstruction head (decoder x̂ = dec(z), MSE/NLL on x). Everything else identical to v3 (Lipschitz encoder, WDGRL, 300k sims, legacy norm). Tests whether the flow objective is load-bearing or if a simpler reconstruction loss gives comparable alignment.
+
+### exp/spin — domain translation (likely separate repo)
+
+SPIN domain translation: train G_sr (sim→real) and G_rs (real→sim) generators on raw observations. Cycle x_sim → G_sr → G_rs = x_srs retains θ labels; information-preservation loss = MI(θ; x_srs) via flow log-prob. At test time: x_real → G_rs → encoder → flow → posterior. No real labels needed. Start with frozen v3 encoder+flow, then retrain jointly. Keep generators small (1D ResNet, 3–4 blocks) given only 802 real patients for discriminator. Likely warrants a separate git repo given scope.
+
 ## Next steps
 
 - **Prior acceptance rate**: v3 eval shows ~5% acceptance (50/1000 samples in-prior per patient). Not a problem — 50 samples gives stable posterior means. Try evaluating without prior filter and compare scatter plots to see if it changes results meaningfully.
 
-- **Stochastic encoder + parameter decoder (implicit posterior)**: replace the flow with a stochastic encoder x → (μ_z, σ_z) and a deterministic MLP decoder z → θ. Posterior at inference: sample z₁...z_N ~ q(z|x), push through decoder — {θ̂_i} is the posterior. Training objective is MSE/NLL on θ directly (no reconstruction of x). Needs mild KL(q(z|x) ∥ N(0,I)) regularisation to prevent σ collapse; WDGRL alignment applies in z-space as before. Calibration check is identical to current approach (coverage of true θ in percentile intervals of {θ̂_i}). Simpler and faster than flow; posterior is implicit but fully sampleable.
+- **Extended v3 run**: v3 was still improving at ep400 (task trending 12.4–12.8 in final 50 ep, patience=30 never fired). Consider rerunning to 600–800 epochs with identical config.
 
-### Post-hoc corrections
-
-Real-patient posteriors are miscalibrated — the posterior is sharper than warranted because the encoder/flow were trained on sim data that does not match the noise and variability of real waveforms. Two post-hoc fixes that do not require retraining:
-
-- **Temperature scaling**: divide the flow log-prob by a temperature T before sampling, which broadens posteriors uniformly. T cannot be estimated without real ground-truth θ, but SVR and PVR can be derived directly from cath lab measurements (mean arterial pressure / cardiac output via thermodilution). Calibrate T by minimising the calibration error on SVR and PVR across the 802 real patients, then apply the same T to all 25 parameters.
-
-- **Post-hoc calibration fixes**: after temperature scaling, per-parameter recalibration (isotonic regression or Platt scaling on the percentile ranks) can correct residual asymmetries. Requires the same 2 ground-truth quantities (SVR/PVR) as a calibration set.
-
-### Data-level domain adaptation
-
-Address the sim-to-real gap at the observation level rather than in latent space:
-
-- **SPIN domain translation (v5)**: train G_sr (sim→real) and G_rs (real→sim) generators on raw observations. Cycle x_sim → G_sr → G_rs = x_srs retains θ labels; information-preservation loss = MI(θ; x_srs) via flow log-prob. At test time: x_real → G_rs → encoder → flow → posterior. No real labels needed. Start with frozen v3 encoder+flow (v5a), then try with v4 VAE encoder (v5b). Keep generators small (1D ResNet, 3–4 blocks) given only 802 real patients for discriminator. Gate: if v5a fails, 802 reals is likely too few for the discriminator — v5b won't help.
-
-- **Realistic noise model**: characterise the noise and artefact structure in real patient waveforms (sensor noise, catheter ringing, respiration drift) and add matched noise to sim observations at training time. This narrows the domain gap before WDGRL or SPIN are applied. Start with a simple parameterised model (additive Gaussian + low-frequency sinusoidal drift) fit to real waveform residuals.
-
-- **Learning noise parameters jointly**: eventually learn the noise parameters (noise amplitude, drift frequency/amplitude) as latent variables alongside θ, with a prior that regularises them toward the characterised noise model. Requires the noise model to be differentiable so gradients flow back through the noise process into the flow.
 
 ## Infra
 
