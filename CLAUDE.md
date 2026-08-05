@@ -53,16 +53,13 @@ Simulation-based inference (SBI) over cardiovascular physiology. Given 4 right-h
 
 ## Current experiment status
 
-| Run | Status | Notes |
-|-----|--------|-------|
-| `exp-v3_encoder-lipschitz_dann_flow-maf5` | done | task=12.84, w1=0.85 — **best real-patient model** |
-| `exp-v3.1_encoder-lipschitz_dann_flow-maf5` | done | task=-3.13, w1=0.57 — worse on reals (over-sharp posteriors) |
-| `exp-v3.2_encoder-lipschitz_dann_flow-maf5` | done | task=-1.70, w1=0.38 |
-| `exp-v3_nosv_encoder-lipschitz_dann_flow-maf5` | done | task=14.02, w1=0.84 — 808-dim, no SV scalar |
-| `exp-v3b_encoder-lipschitz_dann_flow-maf5` | done | task=13.03, w1=0.760 — zscore norm, worse than v3 |
-| `exp-v3c_encoder-lipschitz_dann_flow-maf5` | done | task=10.19, w1=1.00 — not better than v3 on reals |
-
-**Key finding**: 1NN proxy inference massively better than direct inference for SV recovery. Posterior means differ between direct/1NN with comparable stds → residual domain gap shifts volume-parameter posteriors OOD. Pressure/resistance params (SVR, PVR, Ras, Rap) work well on reals; volume params (Vrv/Vlv SV) do not.
+**See `experiments.csv`** for the full run table — version, run name, branch, git hash, what changed,
+and the result. That's the current source of truth; don't duplicate its contents here. Bottom line:
+`exp-v3_encoder-lipschitz_dann_flow-maf5` (task=12.84, w1=0.85) remains the best real-patient model.
+Later attempts (v3.1, v3.2, v3c — more sims, higher λ, PCA-nearest subset) all improved sim-side metrics
+but didn't improve real-patient results, or made them worse (over-sharp posteriors amplify residual
+domain shift). DANN judged to have hit its ceiling at this scale — active work moved to `cv-sbi-spin`
+(domain translation instead of domain-adversarial alignment).
 
 ## Key train_joint.py flags
 
@@ -80,8 +77,45 @@ Simulation-based inference (SBI) over cardiovascular physiology. Given 4 right-h
 - Pure hyperparameter variants (n-sims, epochs, λ) commit directly to `main`; the run name is the record.
 - Planned branches: `exp/lip-flow-dann-reconstruct` (reconstruction objective), `exp/spin` (domain translation — likely a separate repo).
 
+## WDGRL implementation notes (v2+)
+
+Three-phase schedule: flow-warmup (enc frozen) → enc-warmup (flow frozen, WDGRL at λ_warm=0.01) → joint
+(enc+flow+WDGRL, λ ramps to target).
+
+**WassersteinCritic** (`models.py`): MLP (latent→128→128→1), LeakyReLU(0.2), no sigmoid. Estimates W1 via
+KR duality.
+
+**Gradient penalty**: interpolates `ẑ = ε·z_sim + (1-ε)·z_real`, `gp = ((||∇f(ẑ)||₂ - 1)²).mean()`.
+`create_graph=True` is critical.
+
+**Critic inner loop** (n_critic=5 per encoder step, encoder detached):
+- `L_critic = -(E_sim[f(z)] - E_real[f(z)]) + 10 * gp`
+- Critic Adam: β1=0.5
+
+**Encoder step**: `total = task_loss + λ * (E_sim[f(z_sim)] - E_real[f(z_real)])`
+
+**λ schedule**: linear or sigmoid `2/(1+e^{-γt})-1` to `--lambda-target`. Phase 1 uses `--lambda-enc-warmup`.
+
+**CLI**: `--n-critic 5`, `--gp-weight 10`, `--critic-hidden 128`, `--lambda-enc-warmup 0.01`,
+`--lambda-schedule [linear|sigmoid]`, `--lambda-gamma 10`
+
+**CSV columns**: `task`, `w1_est`, `gp`, `total`, `lambda`, `phase`
+
+## Mixup augmentation spec (v2.3+)
+
+Per batch draw `batch_size` pairs `(i,j)` from 802 real beats, interpolate `x = α·x_i + (1-α)·x_j` with
+`α ~ Beta(0.4, 0.4)`, optionally add Gaussian noise (σ_wave≈0.03, σ_scalar≈0.01). Expands effective
+diversity from 802 to ~321k unique pairs per epoch.
+
 ## Git conventions
 
 - Never add `Co-Authored-By: Claude` or any AI authorship trailer to commit messages.
 - Always commit before running a full experiment.
 - Git runs only on local Mac — never commit from adamant.
+
+## Untracked shared docs
+
+**`CLAUDE.md`, `experiments.csv`, and `.gitignore` are untracked from git** — standing instructions and
+experiment bookkeeping, not code. Edit them in place; there is one physical copy, unaffected by
+`git checkout`, so nothing needs propagating across branches. Untracking `.gitignore` itself doesn't
+disable its effect — git reads it from disk regardless of whether it's tracked.

@@ -17,3 +17,6 @@ notebooks/mmd/
 notebooks/ae-reduced/
 notebooks/cnn/
 notebooks/ot/
+
+CLAUDE.md
+experiments.csv
