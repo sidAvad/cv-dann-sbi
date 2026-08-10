@@ -127,11 +127,15 @@ def jdot_step(E_sim, E_real, flow_sim, flow_real, x_sim_b, theta_sim_b, real_bea
     # Sinkhorn's epsilon is only meaningful relative to C's own scale (||z||^2/||theta||^2
     # distances can be arbitrarily large depending on encoder/theta magnitude, with no
     # reason to match whatever epsilon happens to be set to) -- solve on a rescaled cost
-    # so epsilon behaves consistently regardless of that raw scale, then apply the
-    # resulting coupling to the true (unscaled) C for the actual loss value.
-    C_scale = C.mean().detach().clamp(min=1e-6)
-    gamma = sinkhorn(C / C_scale, sinkhorn_epsilon, sinkhorn_iters)     # (B, N_real)
-    L_ot  = (gamma * C).sum()                                          # gradient -> z_sim only (z_real detached above)
+    # so epsilon behaves consistently regardless of that raw scale. L_ot itself also uses
+    # the rescaled cost, not the raw one: C's raw magnitude is not only arbitrary but
+    # keeps shifting as E_sim trains, which would make a fixed lam_ot calibrated for
+    # today's scale drift out of balance against L_sim/L_real later in training. The
+    # rescaled version keeps lam_ot's effective meaning stable throughout.
+    C_scale     = C.mean().detach().clamp(min=1e-6)
+    C_scaled    = C / C_scale
+    gamma = sinkhorn(C_scaled, sinkhorn_epsilon, sinkhorn_iters)        # (B, N_real)
+    L_ot  = (gamma * C_scaled).sum()                                   # gradient -> z_sim only (z_real detached above)
 
     # Soft weights per real patient, detached before use in L_real so that loss can't
     # leak gradient back through the coupling into E_sim — L_real shapes E_real only.
