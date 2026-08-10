@@ -2,15 +2,17 @@
 v4: JDOT-based domain adaptation for cardiovascular SBI.
 
 Two independent encoders, two independent flows — no shared flow, no shared encoder,
-no WDGRL critic. Alignment is not adversarial; it's an explicit, differentiable
-optimal-transport coupling between z_sim and z_real, solved via Sinkhorn every step,
-jointly with model training (not a separate "align, then freeze and pseudo-label" pipeline).
+no WDGRL critic. Alignment is not adversarial; it's a hard nearest-neighbor match between
+z_sim and z_real, recomputed every step, jointly with model training (not a separate
+"align, then freeze and pseudo-label" pipeline). No entropic/Sinkhorn regularization and
+no LP-based bipartite assignment — each real point in the batch just takes whichever sim
+point is currently cheapest under the cost below (vanilla JDOT, matching the original
+paper's mechanism rather than a differentiable-soft-coupling variant of it).
 
   E_sim  + flow_sim  : standard NPE, trained directly on labeled sim data
                        (theta_sim, unconditional hard anchor — unchanged from v3).
-  E_real + flow_real : trained on entropy-regularized OT (JDOT)-transported soft
-                       pseudo-labels from sim thetas. This is E_real's ONLY gradient
-                       source.
+  E_real + flow_real : trained on hard-OT-transported pseudo-labels from sim thetas.
+                       This is E_real's ONLY gradient source.
 
 Cost for matching sim i to real j combines feature proximity and label plausibility
 (the "joint" part of Joint Distribution OT):
@@ -25,21 +27,23 @@ evaluations per step — computationally prohibitive). real_guess is computed un
 torch.no_grad(); it's a fixed reference point for deciding which matches are cheap, not
 a differentiable path.
 
+Sim and real batches are both --batch-size (real side via a fresh Mixup draw each step,
+--mixup-n defaulting to --batch-size) so the cost matrix is symmetric (B, B) and every
+real point gets exactly one nearest-sim match every step — no coverage gaps, unlike a
+rectangular assignment. A given real patient's match still varies step to step (both the
+sim permutation and the mixup draw are independently randomized), which is the mechanism
+relied on to avoid fixating on one bad match rather than any explicit regularization.
+
 Gradient routing (this is the load-bearing part — see cv-spin-latent's session notes for
 the full design discussion of why each detach placement matters):
   E_sim  : L_sim (always, full strength) + L_ot's feature term (z_real is DETACHED when
            building the cost matrix for L_ot, so L_ot's gradient reaches E_sim only —
            this is "the JDOT objective finds a better map by shaping E_sim").
   E_real : L_real only. z_real is ATTACHED here (a second, separate use of E_real's
-           output from the one used to build the cost matrix). The soft weights used to
-           combine L_real's per-candidate losses are DETACHED before use, so L_real's
-           gradient can't leak back through the coupling into E_sim — "the flow objective
-           shapes E_real, and only E_real."
-
-L_real itself only evaluates flow_real.log_prob against each real patient's top-K
-highest-weight sim candidates (not all B), for the same computational reason as
-real_guess above — with reasonably peaked Sinkhorn couplings this is a lossless-in-
-practice truncation, not an approximation that changes what's being optimized.
+           output from the one used to build the cost matrix) — matching itself
+           (argmin over a detached cost) contributes no gradient, so L_real's gradient
+           can't leak back into E_sim through the match — "the flow objective shapes
+           E_real, and only E_real."
 
 No warmup-then-freeze phases beyond a brief sim-only warmup (E_sim/flow_sim train alone
 on true theta for --sim-warmup epochs) before the OT/real-side machinery turns on — early
@@ -59,7 +63,6 @@ Usage:
 import argparse
 import csv
 import json
-import math
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -76,91 +79,49 @@ N_PARAMS_INFER = len(PARAM_KEYS_INFER)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# ─── Sinkhorn / JDOT ────────────────────────────────────────────────────────────
+# ─── JDOT (vanilla: hard nearest-neighbor matching, no entropic regularization) ────────
 
-def sinkhorn(C: torch.Tensor, epsilon: float, n_iters: int = 50) -> torch.Tensor:
-    """
-    Entropy-regularized OT coupling for cost matrix C (n_sim, n_real), uniform marginals.
-    Log-domain stabilized (avoids overflow/underflow from raw exp(-C/epsilon) at small
-    epsilon). Fully differentiable — every op here is a standard torch op, gradient
-    flows straight back through to whatever C depended on.
-    """
-    n_sim, n_real = C.shape
-    log_mu = -math.log(n_sim)
-    log_nu = -math.log(n_real)
-
-    f = torch.zeros(n_sim, device=C.device, dtype=C.dtype)
-    g = torch.zeros(n_real, device=C.device, dtype=C.dtype)
-
-    for _ in range(n_iters):
-        f = epsilon * (log_mu - torch.logsumexp((-C + g[None, :]) / epsilon, dim=1))
-        g = epsilon * (log_nu - torch.logsumexp((-C + f[:, None]) / epsilon, dim=0))
-
-    log_gamma = (-C + f[:, None] + g[None, :]) / epsilon
-    return log_gamma.exp()
-
-
-def jdot_step(E_sim, E_real, flow_sim, flow_real, x_sim_b, theta_sim_b, real_beats_all,
-             lam_feat, lam_label, lam_ot, lam_real,
-             sinkhorn_epsilon, sinkhorn_iters, ot_label_samples, ot_topk):
+def jdot_step(E_sim, E_real, flow_sim, flow_real, x_sim_b, theta_sim_b, real_beats_b,
+             lam_feat, lam_label, lam_ot, lam_real, ot_label_samples):
     """
     One combined JDOT step. Returns (loss, info_dict). See module docstring for the
     gradient-routing rationale behind each detach.
+
+    Matching is plain hard nearest-neighbor: each real point in the batch independently
+    takes the closest sim point (by cost) as its pseudo-label -- no Sinkhorn/entropic
+    regularization, no LP-based bipartite assignment. sim and real batches are both
+    --batch-size, so this is symmetric (B, B) each step. Batches are reshuffled every
+    step (real side via fresh Mixup draws, sim side via the usual permutation), so a
+    given real patient sees different nearest-sim matches across steps/epochs -- that
+    variability is the mechanism that keeps this from just memorizing one fixed match.
     """
     z_sim = E_sim(x_sim_b)                              # attached
     L_sim = -flow_sim.log_prob(theta_sim_b, condition=z_sim).mean()
 
-    z_real_full     = E_real(real_beats_all)             # attached — used later for L_real
+    z_real_full     = E_real(real_beats_b)                # attached — used later for L_real
     z_real_detached = z_real_full.detach()                # detached — used for the OT cost only
 
     # Cheap proxy for "what does flow_real currently believe at z_real_j" — amortizes to
     # one batched sample call over all real points, not one flow evaluation per (sim,real)
     # pair. Detached: this is a fixed reference point, not a differentiable path.
     with torch.no_grad():
-        samples    = flow_real.sample((ot_label_samples,), condition=z_real_detached)  # (S, N_real, theta_dim)
-        real_guess = samples.mean(dim=0)                                                # (N_real, theta_dim)
+        samples    = flow_real.sample((ot_label_samples,), condition=z_real_detached)  # (S, B_real, theta_dim)
+        real_guess = samples.mean(dim=0)                                                # (B_real, theta_dim)
 
-    feat_dist  = torch.cdist(z_sim, z_real_detached, p=2) ** 2        # (B, N_real)
-    label_dist = torch.cdist(theta_sim_b, real_guess, p=2) ** 2       # (B, N_real)
+    feat_dist  = torch.cdist(z_sim, z_real_detached, p=2) ** 2        # (B_sim, B_real)
+    label_dist = torch.cdist(theta_sim_b, real_guess, p=2) ** 2       # (B_sim, B_real)
     C = lam_feat * feat_dist + lam_label * label_dist
 
-    # Sinkhorn's epsilon is only meaningful relative to C's own scale (||z||^2/||theta||^2
-    # distances can be arbitrarily large depending on encoder/theta magnitude, with no
-    # reason to match whatever epsilon happens to be set to) -- solve on a rescaled cost
-    # so epsilon behaves consistently regardless of that raw scale. L_ot itself also uses
-    # the rescaled cost, not the raw one: C's raw magnitude is not only arbitrary but
-    # keeps shifting as E_sim trains, which would make a fixed lam_ot calibrated for
-    # today's scale drift out of balance against L_sim/L_real later in training. The
-    # rescaled version keeps lam_ot's effective meaning stable throughout.
-    C_scale     = C.mean().detach().clamp(min=1e-6)
-    C_scaled    = C / C_scale
-    gamma = sinkhorn(C_scaled, sinkhorn_epsilon, sinkhorn_iters)        # (B, N_real)
-    L_ot  = (gamma * C_scaled).sum()                                   # gradient -> z_sim only (z_real detached above)
+    nn_idx = C.argmin(dim=0)                                           # (B_real,) -- nearest sim per real
+    n_real = real_beats_b.shape[0]
+    L_ot   = C[nn_idx, torch.arange(n_real, device=C.device)].mean()   # gradient -> z_sim only (z_real detached above)
 
-    # Soft weights per real patient, detached before use in L_real so that loss can't
-    # leak gradient back through the coupling into E_sim — L_real shapes E_real only.
-    w = (gamma / (gamma.sum(dim=0, keepdim=True) + 1e-12)).detach()    # (B, N_real)
-
-    # Truncate to each real patient's top-K highest-weight sim candidates — with a
-    # reasonably peaked coupling this drops only near-zero-weight pairs, and turns an
-    # O(B * N_real) flow-evaluation cost into O(K * N_real).
-    k_eff = min(ot_topk, w.shape[0])
-    topk_w, topk_idx = torch.topk(w, k=k_eff, dim=0)                   # (K, N_real) each
-    topk_w = (topk_w / (topk_w.sum(dim=0, keepdim=True) + 1e-12))
-
-    n_real = real_beats_all.shape[0]
-    theta_topk  = theta_sim_b[topk_idx]                                            # (K, N_real, theta_dim)
-    theta_flat  = theta_topk.reshape(k_eff * n_real, -1)
-    z_real_flat = z_real_full.unsqueeze(0).expand(k_eff, -1, -1).reshape(k_eff * n_real, -1)  # attached
-
-    logp = flow_real.log_prob(theta_flat, condition=z_real_flat).reshape(k_eff, n_real)
-    L_real = (topk_w * (-logp)).sum(dim=0).mean()
+    theta_matched = theta_sim_b[nn_idx]                                 # (B_real, theta_dim)
+    logp   = flow_real.log_prob(theta_matched, condition=z_real_full)   # z_real_full attached -> gradient -> E_real only
+    L_real = (-logp).mean()
 
     loss = L_sim + lam_ot * L_ot + lam_real * L_real
-    return loss, {
-        "L_sim": L_sim.item(), "L_ot": L_ot.item(), "L_real": L_real.item(),
-        "gamma_max": gamma.max().item(), "gamma_entropy": (-(gamma + 1e-12) * (gamma + 1e-12).log()).sum().item(),
-    }
+    return loss, {"L_sim": L_sim.item(), "L_ot": L_ot.item(), "L_real": L_real.item()}
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -200,19 +161,15 @@ def main():
     parser.add_argument("--lam-label", type=float, default=1.0, help="Weight on label-consistency cost term")
     parser.add_argument("--lam-ot",    type=float, default=0.1, help="Weight on L_ot in E_sim's total loss")
     parser.add_argument("--lam-real",  type=float, default=1.0, help="Target weight on L_real (ramped)")
-    parser.add_argument("--sinkhorn-epsilon", type=float, default=0.1)
-    parser.add_argument("--sinkhorn-iters",   type=int,   default=50)
     parser.add_argument("--ot-label-samples", type=int,   default=8,
                         help="Samples drawn per real patient for the cheap real_guess proxy")
-    parser.add_argument("--ot-topk", type=int, default=8,
-                        help="Top-K sim candidates per real patient used to compute L_real")
-    # Mixup (real side) -- the static 802-patient real set is reused verbatim every step,
-    # which is a large part of why gamma comes out diffuse (entropic OT over a small fixed
-    # discrete support): each step, augment it with freshly-drawn Mixup interpolates of real
-    # patients so the OT target support is denser and varies step to step. mixup-n=0 disables
-    # this and reproduces the original static-802 behavior.
-    parser.add_argument("--mixup-n",     type=int,   default=0,
-                        help="Extra mixup-interpolated real points added per step (0 = disabled)")
+    # Mixup (real side) -- each step draws a fresh batch of Mixup-interpolated real points
+    # (size = --mixup-n, default matches --batch-size so sim/real batches are symmetric),
+    # rather than reusing the same static 802-patient set verbatim every step. mixup-n=0
+    # falls back to that original static-802-every-step behavior.
+    parser.add_argument("--mixup-n",     type=int,   default=None,
+                        help="Real points drawn via mixup per step (default: --batch-size, "
+                             "matching sim batch size 1:1). 0 disables mixup entirely.")
     parser.add_argument("--mixup-alpha", type=float, default=0.2,
                         help="Beta(alpha, alpha) mixing coefficient -- small alpha biases interpolates near one endpoint")
     # Optimization
@@ -220,6 +177,8 @@ def main():
     parser.add_argument("--batch-size", type=int,   default=512)
     parser.add_argument("--log-every",  type=int,   default=5)
     args = parser.parse_args()
+    if args.mixup_n is None:
+        args.mixup_n = args.batch_size
 
     if not (args.run.startswith("exp-") or args.run.startswith("dry-")):
         raise ValueError("--run must start with 'exp-' or 'dry-'")
@@ -242,8 +201,7 @@ def main():
     log(f"Device: {DEVICE}")
     log(f"Schedule: sim_warmup={args.sim_warmup}  real_ramp={args.real_ramp}  max_epochs={args.max_epochs}")
     log(f"JDOT: lam_feat={args.lam_feat}  lam_label={args.lam_label}  lam_ot={args.lam_ot}  "
-        f"lam_real={args.lam_real}  epsilon={args.sinkhorn_epsilon}  iters={args.sinkhorn_iters}  "
-        f"label_samples={args.ot_label_samples}  topk={args.ot_topk}")
+        f"lam_real={args.lam_real}  label_samples={args.ot_label_samples}  (hard nearest-neighbor matching)")
     log(f"Mixup: n={args.mixup_n}  alpha={args.mixup_alpha}")
 
     ghash = git_hash()
@@ -286,9 +244,8 @@ def main():
         command=" ".join(sys.argv), git_hash=ghash, device=DEVICE,
         schedule=dict(sim_warmup=args.sim_warmup, real_ramp=args.real_ramp, max_epochs=args.max_epochs),
         jdot=dict(lam_feat=args.lam_feat, lam_label=args.lam_label, lam_ot=args.lam_ot,
-                  lam_real=args.lam_real, sinkhorn_epsilon=args.sinkhorn_epsilon,
-                  sinkhorn_iters=args.sinkhorn_iters, ot_label_samples=args.ot_label_samples,
-                  ot_topk=args.ot_topk, mixup_n=args.mixup_n, mixup_alpha=args.mixup_alpha),
+                  lam_real=args.lam_real, ot_label_samples=args.ot_label_samples,
+                  matching="hard-nearest-neighbor", mixup_n=args.mixup_n, mixup_alpha=args.mixup_alpha),
         data=dict(n_sims=n_sims, n_real_beats=len(real_beats),
                   sim_data_root=args.sim_data_root, real_data=args.real_data),
         training=dict(lr=args.lr, batch_size=args.batch_size),
@@ -302,8 +259,7 @@ def main():
     csv_path   = run_dir / f"train_log_{date_str}.csv"
     csv_fh     = open(csv_path, "w", newline="")
     csv_writer = csv.writer(csv_fh)
-    csv_writer.writerow(["epoch", "phase", "L_sim", "L_ot", "L_real", "total",
-                        "lam_real", "gamma_max", "gamma_entropy"])
+    csv_writer.writerow(["epoch", "phase", "L_sim", "L_ot", "L_real", "total", "lam_real"])
 
     log("Training...")
     for epoch in range(1, args.max_epochs + 1):
@@ -316,7 +272,7 @@ def main():
         E_sim.train(); flow_sim.train(); E_real.train(); flow_real.train()
 
         perm = torch.randperm(n_total)
-        sums = dict.fromkeys(["L_sim", "L_ot", "L_real", "total", "gamma_max", "gamma_entropy"], 0.0)
+        sums = dict.fromkeys(["L_sim", "L_ot", "L_real", "total"], 0.0)
         n_batches = 0
 
         for start in range(0, n_total, args.batch_size):
@@ -331,21 +287,20 @@ def main():
                 L_sim.backward()
                 torch.nn.utils.clip_grad_norm_(list(E_sim.parameters()) + list(flow_sim.parameters()), 1.0)
                 opt_sim.step()
-                info = {"L_sim": L_sim.item(), "L_ot": 0.0, "L_real": 0.0,
-                       "gamma_max": 0.0, "gamma_entropy": 0.0}
+                info = {"L_sim": L_sim.item(), "L_ot": 0.0, "L_real": 0.0}
             else:
                 opt_real.zero_grad()
+                # Fresh Mixup-drawn real batch every step, sized to match the sim batch
+                # (args.mixup_n defaults to args.batch_size) -- symmetric (B, B) cost matrix,
+                # and a real patient's nearest-sim match varies step to step since both the
+                # sim permutation and the mixup draw are randomized independently.
                 if args.mixup_n > 0:
-                    real_batch = torch.cat(
-                        [real_beats, mixup_real(real_beats, args.mixup_n, args.mixup_alpha, DEVICE)],
-                        dim=0,
-                    )
+                    real_batch = mixup_real(real_beats, args.mixup_n, args.mixup_alpha, DEVICE)
                 else:
                     real_batch = real_beats
                 loss, info = jdot_step(
                     E_sim, E_real, flow_sim, flow_real, x_sim_b, theta_b, real_batch,
-                    args.lam_feat, args.lam_label, args.lam_ot, lam_real_ep,
-                    args.sinkhorn_epsilon, args.sinkhorn_iters, args.ot_label_samples, args.ot_topk,
+                    args.lam_feat, args.lam_label, args.lam_ot, lam_real_ep, args.ot_label_samples,
                 )
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(list(E_sim.parameters()) + list(flow_sim.parameters()), 1.0)
@@ -355,21 +310,19 @@ def main():
             total = info["L_sim"] + args.lam_ot * info["L_ot"] + lam_real_ep * info["L_real"]
             sums["L_sim"] += info["L_sim"]; sums["L_ot"] += info["L_ot"]; sums["L_real"] += info["L_real"]
             sums["total"] += total
-            sums["gamma_max"] += info["gamma_max"]; sums["gamma_entropy"] += info["gamma_entropy"]
             n_batches += 1
 
         avg = {k: v / n_batches for k, v in sums.items()}
         phase_name = "sim-warmup" if not joint else "joint"
 
         csv_writer.writerow([epoch, phase_name, f"{avg['L_sim']:.5f}", f"{avg['L_ot']:.5f}",
-                            f"{avg['L_real']:.5f}", f"{avg['total']:.5f}", f"{lam_real_ep:.4f}",
-                            f"{avg['gamma_max']:.5f}", f"{avg['gamma_entropy']:.5f}"])
+                            f"{avg['L_real']:.5f}", f"{avg['total']:.5f}", f"{lam_real_ep:.4f}"])
         csv_fh.flush()
 
         if epoch % args.log_every == 0 or epoch == 1:
             log(f"  ep {epoch:4d}/{args.max_epochs}  [{phase_name}]"
                 f"  L_sim={avg['L_sim']:.4f}  L_ot={avg['L_ot']:.4f}  L_real={avg['L_real']:.4f}"
-                f"  lam_real={lam_real_ep:.3f}  gamma_max={avg['gamma_max']:.4f}")
+                f"  lam_real={lam_real_ep:.3f}")
 
     csv_fh.close()
 
