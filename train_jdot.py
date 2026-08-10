@@ -64,9 +64,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import torch
-import torch.nn as nn
 
 from dataset import PARAM_KEYS_INFER, load_stats, load_manifest
 from models import LipschitzReducedAutoencoderEncoder
