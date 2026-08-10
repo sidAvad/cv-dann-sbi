@@ -93,8 +93,8 @@ def sinkhorn(C: torch.Tensor, epsilon: float, n_iters: int = 50) -> torch.Tensor
     g = torch.zeros(n_real, device=C.device, dtype=C.dtype)
 
     for _ in range(n_iters):
-        f = epsilon * (log_mu - torch.logsumexp((-C + g[None, :]) / epsilon, dim=1)) + f
-        g = epsilon * (log_nu - torch.logsumexp((-C + f[:, None]) / epsilon, dim=0)) + g
+        f = epsilon * (log_mu - torch.logsumexp((-C + g[None, :]) / epsilon, dim=1))
+        g = epsilon * (log_nu - torch.logsumexp((-C + f[:, None]) / epsilon, dim=0))
 
     log_gamma = (-C + f[:, None] + g[None, :]) / epsilon
     return log_gamma.exp()
