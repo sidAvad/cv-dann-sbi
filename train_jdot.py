@@ -69,7 +69,7 @@ import torch
 from dataset import PARAM_KEYS_INFER, load_stats, load_manifest
 from models import LipschitzReducedAutoencoderEncoder
 from train_joint import (
-    git_hash, Tee, parse_run, load_sim_data, load_real_beats, build_flow_net,
+    git_hash, Tee, load_sim_data, load_real_beats, build_flow_net,
 )
 
 N_PARAMS_INFER = len(PARAM_KEYS_INFER)
@@ -176,6 +176,13 @@ def main():
     parser.add_argument("--stats-path",    default="norm_stats.json")
     parser.add_argument("--manifest-train", default="manifest_train.json")
     parser.add_argument("--n-sims",        type=int, default=None)
+    parser.add_argument("--outputs-root", default="/home/sa4604/outputs/cv-dann-sbi",
+                        help="Absolute root for run_dir -- train_joint.py's parse_run() uses a "
+                             "CWD-relative Path('outputs')/run, which silently writes into "
+                             "~/projects/cv-dann-sbi/outputs/ instead of ~/outputs/cv-dann-sbi/ "
+                             "when launched from the code checkout (same bug already found and "
+                             "fixed in cv-sbi-spin/cv-spin-latent; not yet fixed in train_joint.py "
+                             "itself). This script doesn't use parse_run for that reason.")
     # Encoder
     parser.add_argument("--latent-dim", type=int,   default=128)
     parser.add_argument("--sn-ceiling", type=float, default=2.0)
@@ -205,7 +212,10 @@ def main():
     parser.add_argument("--log-every",  type=int,   default=5)
     args = parser.parse_args()
 
-    run_type, run_dir = parse_run(args.run)
+    if not (args.run.startswith("exp-") or args.run.startswith("dry-")):
+        raise ValueError("--run must start with 'exp-' or 'dry-'")
+    run_type = "dry" if args.run.startswith("dry-") else "exp"
+    run_dir  = Path(args.outputs_root) / args.run
     n_sims = args.n_sims or 100_000
     run_dir.mkdir(parents=True, exist_ok=True)
 
