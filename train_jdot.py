@@ -69,7 +69,7 @@ import torch
 from dataset import PARAM_KEYS_INFER, load_stats, load_manifest
 from models import LipschitzReducedAutoencoderEncoder
 from train_joint import (
-    git_hash, Tee, load_sim_data, load_real_beats, build_flow_net,
+    git_hash, Tee, load_sim_data, load_real_beats, build_flow_net, mixup_real,
 )
 
 N_PARAMS_INFER = len(PARAM_KEYS_INFER)
@@ -206,6 +206,15 @@ def main():
                         help="Samples drawn per real patient for the cheap real_guess proxy")
     parser.add_argument("--ot-topk", type=int, default=8,
                         help="Top-K sim candidates per real patient used to compute L_real")
+    # Mixup (real side) -- the static 802-patient real set is reused verbatim every step,
+    # which is a large part of why gamma comes out diffuse (entropic OT over a small fixed
+    # discrete support): each step, augment it with freshly-drawn Mixup interpolates of real
+    # patients so the OT target support is denser and varies step to step. mixup-n=0 disables
+    # this and reproduces the original static-802 behavior.
+    parser.add_argument("--mixup-n",     type=int,   default=0,
+                        help="Extra mixup-interpolated real points added per step (0 = disabled)")
+    parser.add_argument("--mixup-alpha", type=float, default=0.2,
+                        help="Beta(alpha, alpha) mixing coefficient -- small alpha biases interpolates near one endpoint")
     # Optimization
     parser.add_argument("--lr",         type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int,   default=512)
@@ -235,6 +244,7 @@ def main():
     log(f"JDOT: lam_feat={args.lam_feat}  lam_label={args.lam_label}  lam_ot={args.lam_ot}  "
         f"lam_real={args.lam_real}  epsilon={args.sinkhorn_epsilon}  iters={args.sinkhorn_iters}  "
         f"label_samples={args.ot_label_samples}  topk={args.ot_topk}")
+    log(f"Mixup: n={args.mixup_n}  alpha={args.mixup_alpha}")
 
     ghash = git_hash()
 
@@ -278,7 +288,7 @@ def main():
         jdot=dict(lam_feat=args.lam_feat, lam_label=args.lam_label, lam_ot=args.lam_ot,
                   lam_real=args.lam_real, sinkhorn_epsilon=args.sinkhorn_epsilon,
                   sinkhorn_iters=args.sinkhorn_iters, ot_label_samples=args.ot_label_samples,
-                  ot_topk=args.ot_topk),
+                  ot_topk=args.ot_topk, mixup_n=args.mixup_n, mixup_alpha=args.mixup_alpha),
         data=dict(n_sims=n_sims, n_real_beats=len(real_beats),
                   sim_data_root=args.sim_data_root, real_data=args.real_data),
         training=dict(lr=args.lr, batch_size=args.batch_size),
@@ -325,8 +335,15 @@ def main():
                        "gamma_max": 0.0, "gamma_entropy": 0.0}
             else:
                 opt_real.zero_grad()
+                if args.mixup_n > 0:
+                    real_batch = torch.cat(
+                        [real_beats, mixup_real(real_beats, args.mixup_n, args.mixup_alpha, DEVICE)],
+                        dim=0,
+                    )
+                else:
+                    real_batch = real_beats
                 loss, info = jdot_step(
-                    E_sim, E_real, flow_sim, flow_real, x_sim_b, theta_b, real_beats,
+                    E_sim, E_real, flow_sim, flow_real, x_sim_b, theta_b, real_batch,
                     args.lam_feat, args.lam_label, args.lam_ot, lam_real_ep,
                     args.sinkhorn_epsilon, args.sinkhorn_iters, args.ot_label_samples, args.ot_topk,
                 )
