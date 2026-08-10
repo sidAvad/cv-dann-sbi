@@ -165,11 +165,24 @@ def main():
                         help="Epochs of E_sim/flow_sim-only training before JDOT/E_real turn on")
     parser.add_argument("--real-ramp",  type=int, default=30,
                         help="Epochs (after sim-warmup) over which lam_real ramps 0 -> target")
+    parser.add_argument("--ot-ramp",    type=int, default=30,
+                        help="Epochs (after sim-warmup) over which lam_ot ramps 0 -> target, "
+                             "same shape as --real-ramp -- avoids shocking L_sim's gradient "
+                             "direction the instant the joint phase starts")
     parser.add_argument("--max-epochs", type=int, default=400)
     # JDOT
     parser.add_argument("--lam-feat",  type=float, default=1.0, help="Weight on feature-distance cost term")
     parser.add_argument("--lam-label", type=float, default=1.0, help="Weight on label-consistency cost term")
-    parser.add_argument("--lam-ot",    type=float, default=0.1, help="Weight on L_ot in E_sim's total loss")
+    parser.add_argument("--lam-ot",    type=float, default=0.1,
+                        help="Target weight on L_ot in E_sim's total loss (ramped, like lam_real). "
+                             "L_ot is C_scaled's mean-normalized nearest-match cost, not an NLL, so "
+                             "it sits ~O(1/batch_size) regardless of lam_ot -- exp-v4_jdot's actual "
+                             "run showed L_sim/L_ot ratios of ~1200-2500 across training, meaning the "
+                             "old default of 0.1 gave L_ot ~1/10,000th of L_sim's gradient weight and "
+                             "E_sim was free to improve L_sim at L_ot's expense the whole run (L_sim "
+                             "fell monotonically 44->14 while L_ot drifted up 0.0098->0.0122 in the "
+                             "back half). Pick a target here on the order of L_sim/L_ot at the point "
+                             "in training you care about matching, not 0.1.")
     parser.add_argument("--lam-real",  type=float, default=1.0, help="Target weight on L_real (ramped)")
     parser.add_argument("--ot-label-samples", type=int,   default=8,
                         help="Samples drawn per real patient for the cheap real_guess proxy")
@@ -209,8 +222,9 @@ def main():
 
     log(f"Run: {args.run}  v={args.version}  ({run_type})")
     log(f"Device: {DEVICE}")
-    log(f"Schedule: sim_warmup={args.sim_warmup}  real_ramp={args.real_ramp}  max_epochs={args.max_epochs}")
-    log(f"JDOT: lam_feat={args.lam_feat}  lam_label={args.lam_label}  lam_ot={args.lam_ot}  "
+    log(f"Schedule: sim_warmup={args.sim_warmup}  real_ramp={args.real_ramp}  ot_ramp={args.ot_ramp}  "
+        f"max_epochs={args.max_epochs}")
+    log(f"JDOT: lam_feat={args.lam_feat}  lam_label={args.lam_label}  lam_ot(target)={args.lam_ot}  "
         f"lam_real={args.lam_real}  label_samples={args.ot_label_samples}  (hard nearest-neighbor matching)")
     log(f"Mixup: n={args.mixup_n}  alpha={args.mixup_alpha}")
 
@@ -252,7 +266,8 @@ def main():
         run=args.run, version=args.version, type=run_type,
         timestamp=datetime.now().isoformat(timespec="seconds"),
         command=" ".join(sys.argv), git_hash=ghash, device=DEVICE,
-        schedule=dict(sim_warmup=args.sim_warmup, real_ramp=args.real_ramp, max_epochs=args.max_epochs),
+        schedule=dict(sim_warmup=args.sim_warmup, real_ramp=args.real_ramp, ot_ramp=args.ot_ramp,
+                      max_epochs=args.max_epochs),
         jdot=dict(lam_feat=args.lam_feat, lam_label=args.lam_label, lam_ot=args.lam_ot,
                   lam_real=args.lam_real, ot_label_samples=args.ot_label_samples,
                   matching="hard-nearest-neighbor", mixup_n=args.mixup_n, mixup_alpha=args.mixup_alpha),
@@ -269,15 +284,18 @@ def main():
     csv_path   = run_dir / f"train_log_{date_str}.csv"
     csv_fh     = open(csv_path, "w", newline="")
     csv_writer = csv.writer(csv_fh)
-    csv_writer.writerow(["epoch", "phase", "L_sim", "L_ot", "L_real", "total", "lam_real"])
+    csv_writer.writerow(["epoch", "phase", "L_sim", "L_ot", "L_real", "total", "lam_real", "lam_ot"])
 
     log("Training...")
     for epoch in range(1, args.max_epochs + 1):
         joint = epoch > args.sim_warmup
         lam_real_ep = 0.0
+        lam_ot_ep   = 0.0
         if joint:
             t = min(1.0, (epoch - args.sim_warmup) / max(1, args.real_ramp))
             lam_real_ep = args.lam_real * t
+            t_ot = min(1.0, (epoch - args.sim_warmup) / max(1, args.ot_ramp))
+            lam_ot_ep = args.lam_ot * t_ot
 
         E_sim.train(); flow_sim.train(); E_real.train(); flow_real.train()
 
@@ -310,14 +328,14 @@ def main():
                     real_batch = real_beats
                 loss, info = jdot_step(
                     E_sim, E_real, flow_sim, flow_real, x_sim_b, theta_b, real_batch,
-                    args.lam_feat, args.lam_label, args.lam_ot, lam_real_ep, args.ot_label_samples,
+                    args.lam_feat, args.lam_label, lam_ot_ep, lam_real_ep, args.ot_label_samples,
                 )
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(list(E_sim.parameters()) + list(flow_sim.parameters()), 1.0)
                 torch.nn.utils.clip_grad_norm_(list(E_real.parameters()) + list(flow_real.parameters()), 1.0)
                 opt_sim.step(); opt_real.step()
 
-            total = info["L_sim"] + args.lam_ot * info["L_ot"] + lam_real_ep * info["L_real"]
+            total = info["L_sim"] + lam_ot_ep * info["L_ot"] + lam_real_ep * info["L_real"]
             sums["L_sim"] += info["L_sim"]; sums["L_ot"] += info["L_ot"]; sums["L_real"] += info["L_real"]
             sums["total"] += total
             n_batches += 1
@@ -326,13 +344,14 @@ def main():
         phase_name = "sim-warmup" if not joint else "joint"
 
         csv_writer.writerow([epoch, phase_name, f"{avg['L_sim']:.5f}", f"{avg['L_ot']:.5f}",
-                            f"{avg['L_real']:.5f}", f"{avg['total']:.5f}", f"{lam_real_ep:.4f}"])
+                            f"{avg['L_real']:.5f}", f"{avg['total']:.5f}", f"{lam_real_ep:.4f}",
+                            f"{lam_ot_ep:.4f}"])
         csv_fh.flush()
 
         if epoch % args.log_every == 0 or epoch == 1:
             log(f"  ep {epoch:4d}/{args.max_epochs}  [{phase_name}]"
                 f"  L_sim={avg['L_sim']:.4f}  L_ot={avg['L_ot']:.4f}  L_real={avg['L_real']:.4f}"
-                f"  lam_real={lam_real_ep:.3f}")
+                f"  lam_real={lam_real_ep:.3f}  lam_ot={lam_ot_ep:.1f}")
 
     csv_fh.close()
 
