@@ -112,9 +112,19 @@ def jdot_step(E_sim, E_real, flow_sim, flow_real, x_sim_b, theta_sim_b, real_bea
     label_dist = torch.cdist(theta_sim_b, real_guess, p=2) ** 2       # (B_sim, B_real)
     C = lam_feat * feat_dist + lam_label * label_dist
 
-    nn_idx = C.argmin(dim=0)                                           # (B_real,) -- nearest sim per real
+    # C's raw magnitude is arbitrary (depends on ||z||^2/||theta||^2 scale, which itself
+    # drifts as E_sim trains) and was blowing out L_ot to 10^4-10^5 against L_sim's ~50,
+    # swamping L_sim's gradient direction on E_sim even after grad-norm clipping (clipping
+    # only rescales magnitude, not direction). Rescale so lam_ot's effective weight stays
+    # stable regardless of that drift -- same fix the earlier Sinkhorn version needed, for
+    # the same reason; unrelated to Sinkhorn itself. argmin's result is scale-invariant so
+    # this doesn't change which pair gets matched, only L_ot's reported/used magnitude.
+    C_scale = C.mean().detach().clamp(min=1e-6)
+    C_scaled = C / C_scale
+
+    nn_idx = C_scaled.argmin(dim=0)                                          # (B_real,) -- nearest sim per real
     n_real = real_beats_b.shape[0]
-    L_ot   = C[nn_idx, torch.arange(n_real, device=C.device)].mean()   # gradient -> z_sim only (z_real detached above)
+    L_ot   = C_scaled[nn_idx, torch.arange(n_real, device=C.device)].mean()  # gradient -> z_sim only (z_real detached above)
 
     theta_matched = theta_sim_b[nn_idx]                                 # (B_real, theta_dim)
     logp   = flow_real.log_prob(theta_matched, condition=z_real_full)   # z_real_full attached -> gradient -> E_real only
