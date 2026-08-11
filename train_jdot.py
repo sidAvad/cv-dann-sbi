@@ -2,12 +2,21 @@
 v4: JDOT-based domain adaptation for cardiovascular SBI.
 
 Two independent encoders, two independent flows — no shared flow, no shared encoder,
-no WDGRL critic. Alignment is not adversarial; it's a hard nearest-neighbor match between
-z_sim and z_real, recomputed every step, jointly with model training (not a separate
-"align, then freeze and pseudo-label" pipeline). No entropic/Sinkhorn regularization and
-no LP-based bipartite assignment — each real point in the batch just takes whichever sim
-point is currently cheapest under the cost below (vanilla JDOT, matching the original
-paper's mechanism rather than a differentiable-soft-coupling variant of it).
+no WDGRL critic. Alignment is not adversarial; it's a greedy 1:1 match between z_sim and
+z_real, recomputed every step, jointly with model training (not a separate "align, then
+freeze and pseudo-label" pipeline). No entropic/Sinkhorn regularization.
+
+v4b2: matching was originally a plain per-real-point argmin (each real point independently
+takes whichever sim point is cheapest, no constraint that sim points aren't reused) — this
+let many real patients collapse onto the same handful of high-density sim points, diagnosed
+from exp-v4b_jdot's real-patient posteriors having only ~1-2% of the true parameter variance
+for Rap/Ras despite L_real improving cleanly all through training. Matching is now a greedy
+1:1 assignment (see greedy_match) over an oversized sim candidate pool (--ot-pool-mult *
+batch_size sim points per batch, matched against --batch-size real points): each sim point
+usable by at most one real point per step, forbidding the collapse, while most of the pool
+still goes unmatched each step since there are more candidates than real points to fill —
+deliberately not a full bijection, since some sim points are legitimately not a good match
+for any real patient and shouldn't be forced onto one just to keep every sim point "busy".
 
   E_sim  + flow_sim  : standard NPE, trained directly on labeled sim data
                        (theta_sim, unconditional hard anchor — unchanged from v3).
@@ -27,12 +36,12 @@ evaluations per step — computationally prohibitive). real_guess is computed un
 torch.no_grad(); it's a fixed reference point for deciding which matches are cheap, not
 a differentiable path.
 
-Sim and real batches are both --batch-size (real side via a fresh Mixup draw each step,
---mixup-n defaulting to --batch-size) so the cost matrix is symmetric (B, B) and every
-real point gets exactly one nearest-sim match every step — no coverage gaps, unlike a
-rectangular assignment. A given real patient's match still varies step to step (both the
-sim permutation and the mixup draw are independently randomized), which is the mechanism
-relied on to avoid fixating on one bad match rather than any explicit regularization.
+Real batch is --batch-size (via a fresh Mixup draw each step, --mixup-n defaulting to
+--batch-size); the sim matching pool is --ot-pool-mult * --batch-size, freshly drawn each
+step (with replacement) from the full sim set, independent of the sequential --batch-size
+sim batch used for L_sim. A given real patient's match still varies step to step (mixup
+draw, sim pool draw, and the greedy assignment's own dependence on the current C are all
+different each step).
 
 Gradient routing (this is the load-bearing part — see cv-spin-latent's session notes for
 the full design discussion of why each detach placement matters):
@@ -67,6 +76,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from dataset import PARAM_KEYS_INFER, load_stats, load_manifest
@@ -79,24 +89,72 @@ N_PARAMS_INFER = len(PARAM_KEYS_INFER)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# ─── JDOT (vanilla: hard nearest-neighbor matching, no entropic regularization) ────────
+# ─── JDOT (greedy 1:1 matching over an oversized sim pool, no entropic regularization) ──
 
-def jdot_step(E_sim, E_real, flow_sim, flow_real, x_sim_b, theta_sim_b, real_beats_b,
+def greedy_match(C: torch.Tensor) -> torch.Tensor:
+    """
+    Greedy 1:1 assignment: each real point (columns) gets exactly one sim point
+    (rows), and each sim point is used by at most one real point. Unlike a plain
+    per-column argmin (C.argmin(dim=0)), this forbids multiple real points from
+    collapsing onto the same cheap sim match -- exp-v4b_jdot's real-patient
+    posteriors turned out to have ~1-2% of the true parameter variance (Rap/Ras),
+    consistent with most of the 802 real patients getting pulled into a small
+    shared cluster of high-density sim points during matching.
+
+    C's row count (sim pool, --ot-pool-mult * batch_size) is intentionally larger
+    than its column count (real batch) -- most sim rows go unmatched most steps.
+    That's deliberate: we only want to forbid *sharing* a match, not force every
+    sim point (including physiologically-implausible ones a real patient
+    shouldn't be matched to) to be used somewhere every step.
+
+    Not globally optimal (that's Hungarian/linear_sum_assignment, O(rows*cols^2)
+    and too slow to run every training step at this scale) -- a greedy nearest-
+    cost-first pass, which is enough to break the sharing that caused the
+    collapse without the cubic cost.
+    """
+    n_sim, n_real = C.shape
+    order  = C.reshape(-1).argsort()
+    sim_i  = (order // n_real).cpu().numpy()
+    real_j = (order %  n_real).cpu().numpy()
+
+    sim_used  = np.zeros(n_sim,  dtype=bool)
+    real_used = np.zeros(n_real, dtype=bool)
+    nn_idx    = np.empty(n_real, dtype=np.int64)
+    n_matched = 0
+    for i, j in zip(sim_i, real_j):
+        if sim_used[i] or real_used[j]:
+            continue
+        nn_idx[j] = i
+        sim_used[i] = True
+        real_used[j] = True
+        n_matched += 1
+        if n_matched == n_real:
+            break
+    return torch.from_numpy(nn_idx).to(C.device)
+
+
+def jdot_step(E_sim, E_real, flow_sim, flow_real, x_sim_b, theta_sim_b,
+             x_sim_pool, theta_sim_pool, real_beats_b,
              lam_feat, lam_label, lam_ot, lam_real, ot_label_samples):
     """
     One combined JDOT step. Returns (loss, info_dict). See module docstring for the
     gradient-routing rationale behind each detach.
 
-    Matching is plain hard nearest-neighbor: each real point in the batch independently
-    takes the closest sim point (by cost) as its pseudo-label -- no Sinkhorn/entropic
-    regularization, no LP-based bipartite assignment. sim and real batches are both
-    --batch-size, so this is symmetric (B, B) each step. Batches are reshuffled every
-    step (real side via fresh Mixup draws, sim side via the usual permutation), so a
-    given real patient sees different nearest-sim matches across steps/epochs -- that
-    variability is the mechanism that keeps this from just memorizing one fixed match.
+    Matching is greedy 1:1 over an oversized sim candidate pool (x_sim_pool/theta_sim_pool,
+    size --ot-pool-mult * batch_size, independent of x_sim_b/theta_sim_b which is only used
+    for L_sim) -- see greedy_match's docstring for why: plain per-real-point argmin let many
+    real patients collapse onto the same handful of cheap sim matches (diagnosed from
+    exp-v4b_jdot's real-patient posteriors having ~1-2% of the true parameter variance for
+    Rap/Ras), and a plain B=B bijection would force every sim point to be used every step,
+    which we don't want either -- some sim points are legitimately not a good match for any
+    real patient in a given batch. Batches are reshuffled every step (real side via fresh
+    Mixup draws, sim pool via a fresh random draw), so a given real patient sees different
+    candidate matches across steps/epochs.
     """
     z_sim = E_sim(x_sim_b)                              # attached
     L_sim = -flow_sim.log_prob(theta_sim_b, condition=z_sim).mean()
+
+    z_sim_pool = E_sim(x_sim_pool)   # attached -- OT cost's gradient into E_sim flows from here
 
     z_real_full     = E_real(real_beats_b)                # attached — used later for L_real
     z_real_detached = z_real_full.detach()                # detached — used for the OT cost only
@@ -108,8 +166,8 @@ def jdot_step(E_sim, E_real, flow_sim, flow_real, x_sim_b, theta_sim_b, real_bea
         samples    = flow_real.sample((ot_label_samples,), condition=z_real_detached)  # (S, B_real, theta_dim)
         real_guess = samples.mean(dim=0)                                                # (B_real, theta_dim)
 
-    feat_dist  = torch.cdist(z_sim, z_real_detached, p=2) ** 2        # (B_sim, B_real)
-    label_dist = torch.cdist(theta_sim_b, real_guess, p=2) ** 2       # (B_sim, B_real)
+    feat_dist  = torch.cdist(z_sim_pool, z_real_detached, p=2) ** 2        # (M, B_real)
+    label_dist = torch.cdist(theta_sim_pool, real_guess, p=2) ** 2        # (M, B_real)
     C = lam_feat * feat_dist + lam_label * label_dist
 
     # C's raw magnitude is arbitrary (depends on ||z||^2/||theta||^2 scale, which itself
@@ -117,16 +175,16 @@ def jdot_step(E_sim, E_real, flow_sim, flow_real, x_sim_b, theta_sim_b, real_bea
     # swamping L_sim's gradient direction on E_sim even after grad-norm clipping (clipping
     # only rescales magnitude, not direction). Rescale so lam_ot's effective weight stays
     # stable regardless of that drift -- same fix the earlier Sinkhorn version needed, for
-    # the same reason; unrelated to Sinkhorn itself. argmin's result is scale-invariant so
-    # this doesn't change which pair gets matched, only L_ot's reported/used magnitude.
+    # the same reason; unrelated to Sinkhorn itself. Matching is scale-invariant so this
+    # doesn't change which pairs get matched, only L_ot's reported/used magnitude.
     C_scale = C.mean().detach().clamp(min=1e-6)
     C_scaled = C / C_scale
 
-    nn_idx = C_scaled.argmin(dim=0)                                          # (B_real,) -- nearest sim per real
+    nn_idx = greedy_match(C_scaled.detach())                                # (B_real,) -- one distinct sim index per real point
     n_real = real_beats_b.shape[0]
-    L_ot   = C_scaled[nn_idx, torch.arange(n_real, device=C.device)].mean()  # gradient -> z_sim only (z_real detached above)
+    L_ot   = C_scaled[nn_idx, torch.arange(n_real, device=C.device)].mean()  # gradient -> z_sim_pool only (z_real detached above)
 
-    theta_matched = theta_sim_b[nn_idx]                                 # (B_real, theta_dim)
+    theta_matched = theta_sim_pool[nn_idx]                              # (B_real, theta_dim)
     logp   = flow_real.log_prob(theta_matched, condition=z_real_full)   # z_real_full attached -> gradient -> E_real only
     L_real = (-logp).mean()
 
@@ -186,6 +244,10 @@ def main():
     parser.add_argument("--lam-real",  type=float, default=1.0, help="Target weight on L_real (ramped)")
     parser.add_argument("--ot-label-samples", type=int,   default=8,
                         help="Samples drawn per real patient for the cheap real_guess proxy")
+    parser.add_argument("--ot-pool-mult", type=int, default=4,
+                        help="Sim candidate pool for matching = ot_pool_mult * batch_size, freshly "
+                             "drawn each step, matched (greedy 1:1) against --batch-size real points. "
+                             "> 1 so most sim candidates go unmatched each step -- see greedy_match.")
     # Mixup (real side) -- each step draws a fresh batch of Mixup-interpolated real points
     # (size = --mixup-n, default matches --batch-size so sim/real batches are symmetric),
     # rather than reusing the same static 802-patient set verbatim every step. mixup-n=0
@@ -225,7 +287,8 @@ def main():
     log(f"Schedule: sim_warmup={args.sim_warmup}  real_ramp={args.real_ramp}  ot_ramp={args.ot_ramp}  "
         f"max_epochs={args.max_epochs}")
     log(f"JDOT: lam_feat={args.lam_feat}  lam_label={args.lam_label}  lam_ot(target)={args.lam_ot}  "
-        f"lam_real={args.lam_real}  label_samples={args.ot_label_samples}  (hard nearest-neighbor matching)")
+        f"lam_real={args.lam_real}  label_samples={args.ot_label_samples}  "
+        f"ot_pool_mult={args.ot_pool_mult}  (greedy 1:1 matching)")
     log(f"Mixup: n={args.mixup_n}  alpha={args.mixup_alpha}")
 
     ghash = git_hash()
@@ -270,7 +333,8 @@ def main():
                       max_epochs=args.max_epochs),
         jdot=dict(lam_feat=args.lam_feat, lam_label=args.lam_label, lam_ot=args.lam_ot,
                   lam_real=args.lam_real, ot_label_samples=args.ot_label_samples,
-                  matching="hard-nearest-neighbor", mixup_n=args.mixup_n, mixup_alpha=args.mixup_alpha),
+                  ot_pool_mult=args.ot_pool_mult,
+                  matching="greedy-1to1", mixup_n=args.mixup_n, mixup_alpha=args.mixup_alpha),
         data=dict(n_sims=n_sims, n_real_beats=len(real_beats),
                   sim_data_root=args.sim_data_root, real_data=args.real_data),
         training=dict(lr=args.lr, batch_size=args.batch_size),
@@ -326,8 +390,15 @@ def main():
                     real_batch = mixup_real(real_beats, args.mixup_n, args.mixup_alpha, DEVICE)
                 else:
                     real_batch = real_beats
+                # Sim matching pool: fresh random draw (with replacement), independent of
+                # x_sim_b/theta_b (which is only used for L_sim) and larger than the real
+                # batch by --ot-pool-mult -- see greedy_match's docstring for why.
+                pool_idx        = torch.randint(0, n_total, (args.ot_pool_mult * args.batch_size,))
+                x_sim_pool     = x_all[pool_idx].to(DEVICE)
+                theta_sim_pool = theta_all[pool_idx].to(DEVICE)
                 loss, info = jdot_step(
-                    E_sim, E_real, flow_sim, flow_real, x_sim_b, theta_b, real_batch,
+                    E_sim, E_real, flow_sim, flow_real, x_sim_b, theta_b,
+                    x_sim_pool, theta_sim_pool, real_batch,
                     args.lam_feat, args.lam_label, lam_ot_ep, lam_real_ep, args.ot_label_samples,
                 )
                 loss.backward()
