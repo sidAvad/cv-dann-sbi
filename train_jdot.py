@@ -18,10 +18,25 @@ still goes unmatched each step since there are more candidates than real points 
 deliberately not a full bijection, since some sim points are legitimately not a good match
 for any real patient and shouldn't be forced onto one just to keep every sim point "busy".
 
+v4d: exp-v4c_jdot's real-patient posteriors showed matching diversity was fixed (acceptance
+21.7%->39.2%, prediction variance recovered dramatically for Ras) but per-patient correspondence
+accuracy was not (R2 still ~0 for 3 of 4 params) -- diagnosed as E_real never having any
+positional/distributional gradient at all: z_real is detached before entering the OT cost, so
+the feature term only ever pulls E_sim toward wherever E_real currently sits, never the reverse.
+Nothing constrains z_real to land anywhere meaningful relative to sim structure in the first
+place. Added a WassersteinCritic (WDGRL, same mechanism as train_joint.py's proven DANN
+alignment) that pulls E_real's marginal distribution toward E_sim's -- z_sim is DETACHED on the
+encoder side of this loss so only E_real moves (E_sim stays anchored by L_sim + the existing OT
+feature term, doesn't need a second pull). Unlike the OT feature term, the critic compares whole-
+distribution shape, not per-match cost, so it can penalize a real-patient collapse that's locally
+cheap under matching but globally implausible -- exactly the failure mode --ot-pool-mult's
+uniqueness constraint could only patch structurally, not detect.
+
   E_sim  + flow_sim  : standard NPE, trained directly on labeled sim data
                        (theta_sim, unconditional hard anchor — unchanged from v3).
-  E_real + flow_real : trained on hard-OT-transported pseudo-labels from sim thetas.
-                       This is E_real's ONLY gradient source.
+  E_real + flow_real : trained on hard-OT-transported pseudo-labels from sim thetas
+                       (E_real's original gradient source) + WDGRL adversarial pressure
+                       toward E_sim's marginal (v4d, new).
 
 Cost for matching sim i to real j combines feature proximity and label plausibility
 (the "joint" part of Joint Distribution OT):
@@ -80,9 +95,9 @@ import numpy as np
 import torch
 
 from dataset import PARAM_KEYS_INFER, load_stats, load_manifest
-from models import LipschitzReducedAutoencoderEncoder
+from models import LipschitzReducedAutoencoderEncoder, WassersteinCritic
 from train_joint import (
-    git_hash, Tee, load_sim_data, load_real_beats, build_flow_net, mixup_real,
+    git_hash, Tee, load_sim_data, load_real_beats, build_flow_net, mixup_real, gradient_penalty,
 )
 
 N_PARAMS_INFER = len(PARAM_KEYS_INFER)
@@ -133,9 +148,9 @@ def greedy_match(C: torch.Tensor) -> torch.Tensor:
     return torch.from_numpy(nn_idx).to(C.device)
 
 
-def jdot_step(E_sim, E_real, flow_sim, flow_real, x_sim_b, theta_sim_b,
+def jdot_step(E_sim, E_real, flow_sim, flow_real, critic, x_sim_b, theta_sim_b,
              x_sim_pool, theta_sim_pool, real_beats_b,
-             lam_feat, lam_label, lam_ot, lam_real, ot_label_samples):
+             lam_feat, lam_label, lam_ot, lam_real, lam_adv, ot_label_samples):
     """
     One combined JDOT step. Returns (loss, info_dict). See module docstring for the
     gradient-routing rationale behind each detach.
@@ -188,8 +203,18 @@ def jdot_step(E_sim, E_real, flow_sim, flow_real, x_sim_b, theta_sim_b,
     logp   = flow_real.log_prob(theta_matched, condition=z_real_full)   # z_real_full attached -> gradient -> E_real only
     L_real = (-logp).mean()
 
-    loss = L_sim + lam_ot * L_ot + lam_real * L_real
-    return loss, {"L_sim": L_sim.item(), "L_ot": L_ot.item(), "L_real": L_real.item()}
+    # v4d: WDGRL pull on E_real toward E_sim's marginal. z_sim (the B-sized batch already
+    # computed for L_sim, paired 1:1 with real_beats_b for the critic) is DETACHED here so
+    # only E_real moves -- E_sim already has enough anchoring from L_sim + the OT feature
+    # term above and doesn't need a second pull. Minimizing L_adv pushes critic(z_real) up
+    # toward critic(z_sim) (the critic itself is trained separately, see the training loop's
+    # critic inner loop, to score sim high / real low -- same opposite-sign-loss mechanism as
+    # train_joint.py's WDGRL, no GradientReversalLayer).
+    L_adv = critic(z_sim.detach()).mean() - critic(z_real_full).mean()
+
+    loss = L_sim + lam_ot * L_ot + lam_real * L_real + lam_adv * L_adv
+    return loss, {"L_sim": L_sim.item(), "L_ot": L_ot.item(), "L_real": L_real.item(),
+                  "L_adv": L_adv.item()}
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -248,6 +273,19 @@ def main():
                         help="Sim candidate pool for matching = ot_pool_mult * batch_size, freshly "
                              "drawn each step, matched (greedy 1:1) against --batch-size real points. "
                              "> 1 so most sim candidates go unmatched each step -- see greedy_match.")
+    # WDGRL (v4d) -- pulls E_real's marginal toward E_sim's; z_sim is detached on the encoder
+    # side so only E_real moves. Same critic/gradient-penalty mechanism as train_joint.py.
+    parser.add_argument("--lam-adv-max", type=float, default=0.5,
+                        help="Target weight (ramped) on the WDGRL term. Matches the DANN v3 best "
+                             "model's proven lambda=0.5 as a starting point.")
+    parser.add_argument("--adv-ramp", type=int, default=30,
+                        help="Epochs (after sim-warmup) over which lam_adv ramps 0 -> target")
+    parser.add_argument("--n-critic", type=int, default=5,
+                        help="Critic updates per training step")
+    parser.add_argument("--gp-weight", type=float, default=10.0,
+                        help="Gradient penalty coefficient (1-Lipschitz enforcement)")
+    parser.add_argument("--critic-hidden", type=int, default=128,
+                        help="Hidden dim for WassersteinCritic MLP")
     # Mixup (real side) -- each step draws a fresh batch of Mixup-interpolated real points
     # (size = --mixup-n, default matches --batch-size so sim/real batches are symmetric),
     # rather than reusing the same static 802-patient set verbatim every step. mixup-n=0
@@ -285,10 +323,12 @@ def main():
     log(f"Run: {args.run}  v={args.version}  ({run_type})")
     log(f"Device: {DEVICE}")
     log(f"Schedule: sim_warmup={args.sim_warmup}  real_ramp={args.real_ramp}  ot_ramp={args.ot_ramp}  "
-        f"max_epochs={args.max_epochs}")
+        f"adv_ramp={args.adv_ramp}  max_epochs={args.max_epochs}")
     log(f"JDOT: lam_feat={args.lam_feat}  lam_label={args.lam_label}  lam_ot(target)={args.lam_ot}  "
         f"lam_real={args.lam_real}  label_samples={args.ot_label_samples}  "
         f"ot_pool_mult={args.ot_pool_mult}  (greedy 1:1 matching)")
+    log(f"WDGRL: lam_adv(target)={args.lam_adv_max}  n_critic={args.n_critic}  "
+        f"gp_weight={args.gp_weight}  critic_hidden={args.critic_hidden}")
     log(f"Mixup: n={args.mixup_n}  alpha={args.mixup_alpha}")
 
     ghash = git_hash()
@@ -318,11 +358,15 @@ def main():
     flow_real = build_flow_net("flow-maf5", args.latent_dim, theta_all[:n_stats],
                                args.hidden_features, args.num_transforms).to(DEVICE)
 
+    critic = WassersteinCritic(latent_dim=args.latent_dim, hidden=args.critic_hidden).to(DEVICE)
+
     log(f"E_sim/E_real params: {sum(p.numel() for p in E_sim.parameters()):,} each")
     log(f"flow_sim/flow_real params: {sum(p.numel() for p in flow_sim.parameters()):,} each")
+    log(f"critic params: {sum(p.numel() for p in critic.parameters()):,}")
 
-    opt_sim  = torch.optim.Adam(list(E_sim.parameters()) + list(flow_sim.parameters()), lr=args.lr)
-    opt_real = torch.optim.Adam(list(E_real.parameters()) + list(flow_real.parameters()), lr=args.lr)
+    opt_sim    = torch.optim.Adam(list(E_sim.parameters()) + list(flow_sim.parameters()), lr=args.lr)
+    opt_real   = torch.optim.Adam(list(E_real.parameters()) + list(flow_real.parameters()), lr=args.lr)
+    critic_opt = torch.optim.Adam(critic.parameters(), lr=args.lr, betas=(0.5, 0.9))
 
     # ── run_info ──────────────────────────────────────────────────────────────
     run_info = dict(
@@ -330,11 +374,13 @@ def main():
         timestamp=datetime.now().isoformat(timespec="seconds"),
         command=" ".join(sys.argv), git_hash=ghash, device=DEVICE,
         schedule=dict(sim_warmup=args.sim_warmup, real_ramp=args.real_ramp, ot_ramp=args.ot_ramp,
-                      max_epochs=args.max_epochs),
+                      adv_ramp=args.adv_ramp, max_epochs=args.max_epochs),
         jdot=dict(lam_feat=args.lam_feat, lam_label=args.lam_label, lam_ot=args.lam_ot,
                   lam_real=args.lam_real, ot_label_samples=args.ot_label_samples,
                   ot_pool_mult=args.ot_pool_mult,
                   matching="greedy-1to1", mixup_n=args.mixup_n, mixup_alpha=args.mixup_alpha),
+        wdgrl=dict(lam_adv_max=args.lam_adv_max, n_critic=args.n_critic,
+                   gp_weight=args.gp_weight, critic_hidden=args.critic_hidden),
         data=dict(n_sims=n_sims, n_real_beats=len(real_beats),
                   sim_data_root=args.sim_data_root, real_data=args.real_data),
         training=dict(lr=args.lr, batch_size=args.batch_size),
@@ -348,23 +394,33 @@ def main():
     csv_path   = run_dir / f"train_log_{date_str}.csv"
     csv_fh     = open(csv_path, "w", newline="")
     csv_writer = csv.writer(csv_fh)
-    csv_writer.writerow(["epoch", "phase", "L_sim", "L_ot", "L_real", "total", "lam_real", "lam_ot"])
+    csv_writer.writerow(["epoch", "phase", "L_sim", "L_ot", "L_real", "L_adv", "w1_est", "gp",
+                         "total", "lam_real", "lam_ot", "lam_adv"])
+
+    def sample_real_for_critic(n):
+        if args.mixup_n > 0:
+            return mixup_real(real_beats, n, args.mixup_alpha, DEVICE)
+        idx_r = torch.randint(0, len(real_beats), (n,), device=DEVICE)
+        return real_beats[idx_r]
 
     log("Training...")
     for epoch in range(1, args.max_epochs + 1):
         joint = epoch > args.sim_warmup
         lam_real_ep = 0.0
         lam_ot_ep   = 0.0
+        lam_adv_ep  = 0.0
         if joint:
             t = min(1.0, (epoch - args.sim_warmup) / max(1, args.real_ramp))
             lam_real_ep = args.lam_real * t
             t_ot = min(1.0, (epoch - args.sim_warmup) / max(1, args.ot_ramp))
             lam_ot_ep = args.lam_ot * t_ot
+            t_adv = min(1.0, (epoch - args.sim_warmup) / max(1, args.adv_ramp))
+            lam_adv_ep = args.lam_adv_max * t_adv
 
-        E_sim.train(); flow_sim.train(); E_real.train(); flow_real.train()
+        E_sim.train(); flow_sim.train(); E_real.train(); flow_real.train(); critic.train()
 
         perm = torch.randperm(n_total)
-        sums = dict.fromkeys(["L_sim", "L_ot", "L_real", "total"], 0.0)
+        sums = dict.fromkeys(["L_sim", "L_ot", "L_real", "L_adv", "w1_est", "gp", "total"], 0.0)
         n_batches = 0
 
         for start in range(0, n_total, args.batch_size):
@@ -379,7 +435,8 @@ def main():
                 L_sim.backward()
                 torch.nn.utils.clip_grad_norm_(list(E_sim.parameters()) + list(flow_sim.parameters()), 1.0)
                 opt_sim.step()
-                info = {"L_sim": L_sim.item(), "L_ot": 0.0, "L_real": 0.0}
+                info = {"L_sim": L_sim.item(), "L_ot": 0.0, "L_real": 0.0,
+                        "L_adv": 0.0, "w1_est": 0.0, "gp": 0.0}
             else:
                 opt_real.zero_grad()
                 # Fresh Mixup-drawn real batch every step, sized to match the sim batch
@@ -396,18 +453,41 @@ def main():
                 pool_idx        = torch.randint(0, n_total, (args.ot_pool_mult * args.batch_size,))
                 x_sim_pool     = x_all[pool_idx].to(DEVICE)
                 theta_sim_pool = theta_all[pool_idx].to(DEVICE)
+
+                # ── Critic inner loop (WDGRL, v4d) — pulls E_real toward E_sim's marginal.
+                # Fresh real batch per substep (not the same real_batch used below), matching
+                # this codebase's existing WDGRL convention (train_joint.py, cv-spin-latent's
+                # exp-v2c_spin) that fresh-batch-per-substep gives meaningfully different
+                # (better) real-patient behavior than reusing one batch across substeps.
+                batch_w1 = batch_gp = 0.0
+                for _ in range(args.n_critic):
+                    z_sim_d  = E_sim(x_sim_b).detach()
+                    z_real_d = E_real(sample_real_for_critic(len(idx))).detach()
+                    gp     = gradient_penalty(critic, z_sim_d, z_real_d, DEVICE)
+                    w_diff = critic(z_sim_d).mean() - critic(z_real_d).mean()
+                    c_loss = -w_diff + args.gp_weight * gp
+                    critic_opt.zero_grad()
+                    c_loss.backward()
+                    critic_opt.step()
+                    batch_w1 += w_diff.item(); batch_gp += gp.item()
+                batch_w1 /= args.n_critic; batch_gp /= args.n_critic
+
                 loss, info = jdot_step(
-                    E_sim, E_real, flow_sim, flow_real, x_sim_b, theta_b,
+                    E_sim, E_real, flow_sim, flow_real, critic, x_sim_b, theta_b,
                     x_sim_pool, theta_sim_pool, real_batch,
-                    args.lam_feat, args.lam_label, lam_ot_ep, lam_real_ep, args.ot_label_samples,
+                    args.lam_feat, args.lam_label, lam_ot_ep, lam_real_ep, lam_adv_ep,
+                    args.ot_label_samples,
                 )
+                info["w1_est"] = batch_w1; info["gp"] = batch_gp
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(list(E_sim.parameters()) + list(flow_sim.parameters()), 1.0)
                 torch.nn.utils.clip_grad_norm_(list(E_real.parameters()) + list(flow_real.parameters()), 1.0)
                 opt_sim.step(); opt_real.step()
 
-            total = info["L_sim"] + lam_ot_ep * info["L_ot"] + lam_real_ep * info["L_real"]
-            sums["L_sim"] += info["L_sim"]; sums["L_ot"] += info["L_ot"]; sums["L_real"] += info["L_real"]
+            total = (info["L_sim"] + lam_ot_ep * info["L_ot"] + lam_real_ep * info["L_real"]
+                     + lam_adv_ep * info["L_adv"])
+            for k in ["L_sim", "L_ot", "L_real", "L_adv", "w1_est", "gp"]:
+                sums[k] += info[k]
             sums["total"] += total
             n_batches += 1
 
@@ -415,14 +495,16 @@ def main():
         phase_name = "sim-warmup" if not joint else "joint"
 
         csv_writer.writerow([epoch, phase_name, f"{avg['L_sim']:.5f}", f"{avg['L_ot']:.5f}",
-                            f"{avg['L_real']:.5f}", f"{avg['total']:.5f}", f"{lam_real_ep:.4f}",
-                            f"{lam_ot_ep:.4f}"])
+                            f"{avg['L_real']:.5f}", f"{avg['L_adv']:.5f}", f"{avg['w1_est']:.5f}",
+                            f"{avg['gp']:.5f}", f"{avg['total']:.5f}", f"{lam_real_ep:.4f}",
+                            f"{lam_ot_ep:.4f}", f"{lam_adv_ep:.4f}"])
         csv_fh.flush()
 
         if epoch % args.log_every == 0 or epoch == 1:
             log(f"  ep {epoch:4d}/{args.max_epochs}  [{phase_name}]"
                 f"  L_sim={avg['L_sim']:.4f}  L_ot={avg['L_ot']:.4f}  L_real={avg['L_real']:.4f}"
-                f"  lam_real={lam_real_ep:.3f}  lam_ot={lam_ot_ep:.1f}")
+                f"  L_adv={avg['L_adv']:+.4f}  w1={avg['w1_est']:+.4f}  gp={avg['gp']:.4f}"
+                f"  lam_real={lam_real_ep:.3f}  lam_ot={lam_ot_ep:.1f}  lam_adv={lam_adv_ep:.3f}")
 
     csv_fh.close()
 
@@ -431,7 +513,8 @@ def main():
     torch.save(E_real.state_dict(), run_dir / "encoder_real.pt")
     torch.save(flow_sim,  run_dir / "flow_sim.pt")
     torch.save(flow_real, run_dir / "flow_real.pt")
-    log("Saved encoder_sim.pt  encoder_real.pt  flow_sim.pt  flow_real.pt")
+    torch.save(critic.state_dict(), run_dir / "critic.pt")
+    log("Saved encoder_sim.pt  encoder_real.pt  flow_sim.pt  flow_real.pt  critic.pt")
 
     log_fh.close()
     sys.stdout = _stdout
