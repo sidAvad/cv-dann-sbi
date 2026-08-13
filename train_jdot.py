@@ -1,42 +1,43 @@
 """
 v4: JDOT-based domain adaptation for cardiovascular SBI.
 
-Two independent encoders, two independent flows — no shared flow, no shared encoder,
-no WDGRL critic. Alignment is not adversarial; it's a greedy 1:1 match between z_sim and
-z_real, recomputed every step, jointly with model training (not a separate "align, then
-freeze and pseudo-label" pipeline). No entropic/Sinkhorn regularization.
+Two independent encoders, two independent flows — no shared flow, no shared encoder.
+Alignment is a plain per-real-point nearest-sim match, recomputed every step, jointly with
+model training (not a separate "align, then freeze and pseudo-label" pipeline), plus a WDGRL
+critic (v4d+) pulling E_real's marginal toward E_sim's. No entropic/Sinkhorn regularization.
 
-v4b2: matching was originally a plain per-real-point argmin (each real point independently
-takes whichever sim point is cheapest, no constraint that sim points aren't reused) — this
-let many real patients collapse onto the same handful of high-density sim points, diagnosed
-from exp-v4b_jdot's real-patient posteriors having only ~1-2% of the true parameter variance
-for Rap/Ras despite L_real improving cleanly all through training. Matching is now a greedy
-1:1 assignment (see greedy_match) over an oversized sim candidate pool (--ot-pool-mult *
-batch_size sim points per batch, matched against --batch-size real points): each sim point
-usable by at most one real point per step, forbidding the collapse, while most of the pool
-still goes unmatched each step since there are more candidates than real points to fill —
-deliberately not a full bijection, since some sim points are legitimately not a good match
-for any real patient and shouldn't be forced onto one just to keep every sim point "busy".
+v4b2 (exp-v4b_jdot -> exp-v4c_jdot): matching was originally a plain per-real-point argmin
+(each real point independently takes whichever sim point is cheapest, no constraint that sim
+points aren't reused) — this let many real patients collapse onto the same handful of
+high-density sim points, diagnosed from exp-v4b_jdot's real-patient posteriors having only
+~1-2% of the true parameter variance for Rap/Ras despite L_real improving cleanly all through
+training. v4c switched to a greedy 1:1 assignment over an oversized sim candidate pool, which
+fixed prediction diversity (acceptance 21.7%->39.2%, Ras variance recovered to 67% of true) but
+not per-patient correspondence accuracy (R2 still ~0 for 3 of 4 params).
 
-v4d: exp-v4c_jdot's real-patient posteriors showed matching diversity was fixed (acceptance
-21.7%->39.2%, prediction variance recovered dramatically for Ras) but per-patient correspondence
-accuracy was not (R2 still ~0 for 3 of 4 params) -- diagnosed as E_real never having any
-positional/distributional gradient at all: z_real is detached before entering the OT cost, so
-the feature term only ever pulls E_sim toward wherever E_real currently sits, never the reverse.
-Nothing constrains z_real to land anywhere meaningful relative to sim structure in the first
-place. Added a WassersteinCritic (WDGRL, same mechanism as train_joint.py's proven DANN
+v4d: added a WassersteinCritic (WDGRL, same mechanism as train_joint.py's proven DANN
 alignment) that pulls E_real's marginal distribution toward E_sim's -- z_sim is DETACHED on the
-encoder side of this loss so only E_real moves (E_sim stays anchored by L_sim + the existing OT
-feature term, doesn't need a second pull). Unlike the OT feature term, the critic compares whole-
-distribution shape, not per-match cost, so it can penalize a real-patient collapse that's locally
-cheap under matching but globally implausible -- exactly the failure mode --ot-pool-mult's
-uniqueness constraint could only patch structurally, not detect.
+encoder side of this loss so only E_real moves (E_sim stays anchored by L_sim + the OT feature
+term, doesn't need a second pull). Unlike the OT feature term, the critic compares whole-
+distribution shape, not per-match cost, so it can in principle penalize a real-patient collapse
+that's locally cheap under matching but globally implausible. Run alongside v4c's greedy 1:1
+matching (kept unchanged) to isolate whether the critic alone was doing anything -- result:
+L_real plateaued ~40.0-40.5 for the entire second half of training, barely moved from v4c's own
+final value (40.02 vs 40.30) -- the critic added on top of the uniqueness constraint didn't
+help much.
+
+v4e: reverted matching to plain per-real-point argmin (greedy_match / --ot-pool-mult removed),
+keeping the WDGRL critic -- the planned ablation to check whether the critic alone can prevent
+the original collapse without the uniqueness constraint's help, per the reasoning that a global
+distribution-matching term shouldn't need a local structural constraint to avoid a collapse it's
+specifically designed to penalize (and the constraint may cost real match quality when the true
+correspondence is legitimately many-to-one).
 
   E_sim  + flow_sim  : standard NPE, trained directly on labeled sim data
                        (theta_sim, unconditional hard anchor — unchanged from v3).
   E_real + flow_real : trained on hard-OT-transported pseudo-labels from sim thetas
                        (E_real's original gradient source) + WDGRL adversarial pressure
-                       toward E_sim's marginal (v4d, new).
+                       toward E_sim's marginal (v4d+).
 
 Cost for matching sim i to real j combines feature proximity and label plausibility
 (the "joint" part of Joint Distribution OT):
@@ -51,12 +52,10 @@ evaluations per step — computationally prohibitive). real_guess is computed un
 torch.no_grad(); it's a fixed reference point for deciding which matches are cheap, not
 a differentiable path.
 
-Real batch is --batch-size (via a fresh Mixup draw each step, --mixup-n defaulting to
---batch-size); the sim matching pool is --ot-pool-mult * --batch-size, freshly drawn each
-step (with replacement) from the full sim set, independent of the sequential --batch-size
-sim batch used for L_sim. A given real patient's match still varies step to step (mixup
-draw, sim pool draw, and the greedy assignment's own dependence on the current C are all
-different each step).
+Sim and real batches are both --batch-size (real side via a fresh Mixup draw each step,
+--mixup-n defaulting to --batch-size) so the cost matrix is symmetric (B, B) and every real
+point gets exactly one nearest-sim match every step. A given real patient's match still varies
+step to step (mixup draw and sim permutation are both randomized independently).
 
 Gradient routing (this is the load-bearing part — see cv-spin-latent's session notes for
 the full design discussion of why each detach placement matters):
@@ -91,7 +90,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import torch
 
 from dataset import PARAM_KEYS_INFER, load_stats, load_manifest
@@ -104,72 +102,21 @@ N_PARAMS_INFER = len(PARAM_KEYS_INFER)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# ─── JDOT (greedy 1:1 matching over an oversized sim pool, no entropic regularization) ──
+# ─── JDOT (plain per-real-point argmin + WDGRL critic on E_real, no entropic regularization) ──
 
-def greedy_match(C: torch.Tensor) -> torch.Tensor:
-    """
-    Greedy 1:1 assignment: each real point (columns) gets exactly one sim point
-    (rows), and each sim point is used by at most one real point. Unlike a plain
-    per-column argmin (C.argmin(dim=0)), this forbids multiple real points from
-    collapsing onto the same cheap sim match -- exp-v4b_jdot's real-patient
-    posteriors turned out to have ~1-2% of the true parameter variance (Rap/Ras),
-    consistent with most of the 802 real patients getting pulled into a small
-    shared cluster of high-density sim points during matching.
-
-    C's row count (sim pool, --ot-pool-mult * batch_size) is intentionally larger
-    than its column count (real batch) -- most sim rows go unmatched most steps.
-    That's deliberate: we only want to forbid *sharing* a match, not force every
-    sim point (including physiologically-implausible ones a real patient
-    shouldn't be matched to) to be used somewhere every step.
-
-    Not globally optimal (that's Hungarian/linear_sum_assignment, O(rows*cols^2)
-    and too slow to run every training step at this scale) -- a greedy nearest-
-    cost-first pass, which is enough to break the sharing that caused the
-    collapse without the cubic cost.
-    """
-    n_sim, n_real = C.shape
-    order  = C.reshape(-1).argsort()
-    sim_i  = (order // n_real).cpu().numpy()
-    real_j = (order %  n_real).cpu().numpy()
-
-    sim_used  = np.zeros(n_sim,  dtype=bool)
-    real_used = np.zeros(n_real, dtype=bool)
-    nn_idx    = np.empty(n_real, dtype=np.int64)
-    n_matched = 0
-    for i, j in zip(sim_i, real_j):
-        if sim_used[i] or real_used[j]:
-            continue
-        nn_idx[j] = i
-        sim_used[i] = True
-        real_used[j] = True
-        n_matched += 1
-        if n_matched == n_real:
-            break
-    return torch.from_numpy(nn_idx).to(C.device)
-
-
-def jdot_step(E_sim, E_real, flow_sim, flow_real, critic, x_sim_b, theta_sim_b,
-             x_sim_pool, theta_sim_pool, real_beats_b,
+def jdot_step(E_sim, E_real, flow_sim, flow_real, critic, x_sim_b, theta_sim_b, real_beats_b,
              lam_feat, lam_label, lam_ot, lam_real, lam_adv, ot_label_samples):
     """
     One combined JDOT step. Returns (loss, info_dict). See module docstring for the
     gradient-routing rationale behind each detach.
 
-    Matching is greedy 1:1 over an oversized sim candidate pool (x_sim_pool/theta_sim_pool,
-    size --ot-pool-mult * batch_size, independent of x_sim_b/theta_sim_b which is only used
-    for L_sim) -- see greedy_match's docstring for why: plain per-real-point argmin let many
-    real patients collapse onto the same handful of cheap sim matches (diagnosed from
-    exp-v4b_jdot's real-patient posteriors having ~1-2% of the true parameter variance for
-    Rap/Ras), and a plain B=B bijection would force every sim point to be used every step,
-    which we don't want either -- some sim points are legitimately not a good match for any
-    real patient in a given batch. Batches are reshuffled every step (real side via fresh
-    Mixup draws, sim pool via a fresh random draw), so a given real patient sees different
-    candidate matches across steps/epochs.
+    Matching is plain hard nearest-neighbor: each real point in the batch independently
+    takes the closest sim point (by cost) as its pseudo-label -- no uniqueness constraint
+    (v4e reverted v4c's greedy 1:1 assignment; see module docstring for why). Sim and real
+    batches are both --batch-size, so this is symmetric (B, B) each step.
     """
     z_sim = E_sim(x_sim_b)                              # attached
     L_sim = -flow_sim.log_prob(theta_sim_b, condition=z_sim).mean()
-
-    z_sim_pool = E_sim(x_sim_pool)   # attached -- OT cost's gradient into E_sim flows from here
 
     z_real_full     = E_real(real_beats_b)                # attached — used later for L_real
     z_real_detached = z_real_full.detach()                # detached — used for the OT cost only
@@ -181,35 +128,34 @@ def jdot_step(E_sim, E_real, flow_sim, flow_real, critic, x_sim_b, theta_sim_b,
         samples    = flow_real.sample((ot_label_samples,), condition=z_real_detached)  # (S, B_real, theta_dim)
         real_guess = samples.mean(dim=0)                                                # (B_real, theta_dim)
 
-    feat_dist  = torch.cdist(z_sim_pool, z_real_detached, p=2) ** 2        # (M, B_real)
-    label_dist = torch.cdist(theta_sim_pool, real_guess, p=2) ** 2        # (M, B_real)
+    feat_dist  = torch.cdist(z_sim, z_real_detached, p=2) ** 2        # (B_sim, B_real)
+    label_dist = torch.cdist(theta_sim_b, real_guess, p=2) ** 2       # (B_sim, B_real)
     C = lam_feat * feat_dist + lam_label * label_dist
 
     # C's raw magnitude is arbitrary (depends on ||z||^2/||theta||^2 scale, which itself
     # drifts as E_sim trains) and was blowing out L_ot to 10^4-10^5 against L_sim's ~50,
     # swamping L_sim's gradient direction on E_sim even after grad-norm clipping (clipping
     # only rescales magnitude, not direction). Rescale so lam_ot's effective weight stays
-    # stable regardless of that drift -- same fix the earlier Sinkhorn version needed, for
-    # the same reason; unrelated to Sinkhorn itself. Matching is scale-invariant so this
-    # doesn't change which pairs get matched, only L_ot's reported/used magnitude.
+    # stable regardless of that drift. argmin's result is scale-invariant so this doesn't
+    # change which pair gets matched, only L_ot's reported/used magnitude.
     C_scale = C.mean().detach().clamp(min=1e-6)
     C_scaled = C / C_scale
 
-    nn_idx = greedy_match(C_scaled.detach())                                # (B_real,) -- one distinct sim index per real point
+    nn_idx = C_scaled.argmin(dim=0)                                          # (B_real,) -- nearest sim per real
     n_real = real_beats_b.shape[0]
-    L_ot   = C_scaled[nn_idx, torch.arange(n_real, device=C.device)].mean()  # gradient -> z_sim_pool only (z_real detached above)
+    L_ot   = C_scaled[nn_idx, torch.arange(n_real, device=C.device)].mean()  # gradient -> z_sim only (z_real detached above)
 
-    theta_matched = theta_sim_pool[nn_idx]                              # (B_real, theta_dim)
+    theta_matched = theta_sim_b[nn_idx]                                 # (B_real, theta_dim)
     logp   = flow_real.log_prob(theta_matched, condition=z_real_full)   # z_real_full attached -> gradient -> E_real only
     L_real = (-logp).mean()
 
-    # v4d: WDGRL pull on E_real toward E_sim's marginal. z_sim (the B-sized batch already
-    # computed for L_sim, paired 1:1 with real_beats_b for the critic) is DETACHED here so
-    # only E_real moves -- E_sim already has enough anchoring from L_sim + the OT feature
-    # term above and doesn't need a second pull. Minimizing L_adv pushes critic(z_real) up
-    # toward critic(z_sim) (the critic itself is trained separately, see the training loop's
-    # critic inner loop, to score sim high / real low -- same opposite-sign-loss mechanism as
-    # train_joint.py's WDGRL, no GradientReversalLayer).
+    # WDGRL pull on E_real toward E_sim's marginal (v4d+). z_sim (already computed for L_sim,
+    # paired 1:1 with real_beats_b for the critic) is DETACHED here so only E_real moves --
+    # E_sim already has enough anchoring from L_sim + the OT feature term above and doesn't
+    # need a second pull. Minimizing L_adv pushes critic(z_real) up toward critic(z_sim) (the
+    # critic itself is trained separately, see the training loop's critic inner loop, to score
+    # sim high / real low -- same opposite-sign-loss mechanism as train_joint.py's WDGRL, no
+    # GradientReversalLayer).
     L_adv = critic(z_sim.detach()).mean() - critic(z_real_full).mean()
 
     loss = L_sim + lam_ot * L_ot + lam_real * L_real + lam_adv * L_adv
@@ -269,10 +215,6 @@ def main():
     parser.add_argument("--lam-real",  type=float, default=1.0, help="Target weight on L_real (ramped)")
     parser.add_argument("--ot-label-samples", type=int,   default=8,
                         help="Samples drawn per real patient for the cheap real_guess proxy")
-    parser.add_argument("--ot-pool-mult", type=int, default=4,
-                        help="Sim candidate pool for matching = ot_pool_mult * batch_size, freshly "
-                             "drawn each step, matched (greedy 1:1) against --batch-size real points. "
-                             "> 1 so most sim candidates go unmatched each step -- see greedy_match.")
     # WDGRL (v4d) -- pulls E_real's marginal toward E_sim's; z_sim is detached on the encoder
     # side so only E_real moves. Same critic/gradient-penalty mechanism as train_joint.py.
     parser.add_argument("--lam-adv-max", type=float, default=0.5,
@@ -325,8 +267,7 @@ def main():
     log(f"Schedule: sim_warmup={args.sim_warmup}  real_ramp={args.real_ramp}  ot_ramp={args.ot_ramp}  "
         f"adv_ramp={args.adv_ramp}  max_epochs={args.max_epochs}")
     log(f"JDOT: lam_feat={args.lam_feat}  lam_label={args.lam_label}  lam_ot(target)={args.lam_ot}  "
-        f"lam_real={args.lam_real}  label_samples={args.ot_label_samples}  "
-        f"ot_pool_mult={args.ot_pool_mult}  (greedy 1:1 matching)")
+        f"lam_real={args.lam_real}  label_samples={args.ot_label_samples}  (plain argmin matching)")
     log(f"WDGRL: lam_adv(target)={args.lam_adv_max}  n_critic={args.n_critic}  "
         f"gp_weight={args.gp_weight}  critic_hidden={args.critic_hidden}")
     log(f"Mixup: n={args.mixup_n}  alpha={args.mixup_alpha}")
@@ -377,8 +318,7 @@ def main():
                       adv_ramp=args.adv_ramp, max_epochs=args.max_epochs),
         jdot=dict(lam_feat=args.lam_feat, lam_label=args.lam_label, lam_ot=args.lam_ot,
                   lam_real=args.lam_real, ot_label_samples=args.ot_label_samples,
-                  ot_pool_mult=args.ot_pool_mult,
-                  matching="greedy-1to1", mixup_n=args.mixup_n, mixup_alpha=args.mixup_alpha),
+                  matching="argmin", mixup_n=args.mixup_n, mixup_alpha=args.mixup_alpha),
         wdgrl=dict(lam_adv_max=args.lam_adv_max, n_critic=args.n_critic,
                    gp_weight=args.gp_weight, critic_hidden=args.critic_hidden),
         data=dict(n_sims=n_sims, n_real_beats=len(real_beats),
@@ -447,13 +387,6 @@ def main():
                     real_batch = mixup_real(real_beats, args.mixup_n, args.mixup_alpha, DEVICE)
                 else:
                     real_batch = real_beats
-                # Sim matching pool: fresh random draw (with replacement), independent of
-                # x_sim_b/theta_b (which is only used for L_sim) and larger than the real
-                # batch by --ot-pool-mult -- see greedy_match's docstring for why.
-                pool_idx        = torch.randint(0, n_total, (args.ot_pool_mult * args.batch_size,))
-                x_sim_pool     = x_all[pool_idx].to(DEVICE)
-                theta_sim_pool = theta_all[pool_idx].to(DEVICE)
-
                 # ── Critic inner loop (WDGRL, v4d) — pulls E_real toward E_sim's marginal.
                 # Fresh real batch per substep (not the same real_batch used below), matching
                 # this codebase's existing WDGRL convention (train_joint.py, cv-spin-latent's
@@ -473,8 +406,7 @@ def main():
                 batch_w1 /= args.n_critic; batch_gp /= args.n_critic
 
                 loss, info = jdot_step(
-                    E_sim, E_real, flow_sim, flow_real, critic, x_sim_b, theta_b,
-                    x_sim_pool, theta_sim_pool, real_batch,
+                    E_sim, E_real, flow_sim, flow_real, critic, x_sim_b, theta_b, real_batch,
                     args.lam_feat, args.lam_label, lam_ot_ep, lam_real_ep, lam_adv_ep,
                     args.ot_label_samples,
                 )
