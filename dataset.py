@@ -160,12 +160,14 @@ class ReducedCVDataset(Dataset):
     """
 
     def __init__(self, data_dir, index_entries, stats,
-                 include_sv: bool = True, scalar_norm: str = "legacy"):
+                 include_sv: bool = True, scalar_norm: str = "legacy",
+                 noise_snr_db: float | None = None):
         self.data_dir   = data_dir
         self.index      = index_entries
         self._handles   = {}
         self.include_sv = include_sv
         self.scalar_norm = scalar_norm
+        self.noise_snr_db = noise_snr_db
 
         w = stats["waves"]
         p = stats["parameters"]
@@ -210,9 +212,14 @@ class ReducedCVDataset(Dataset):
         theta_infer = torch.cat([theta[:_HR_IDX], theta[_HR_IDX + 1:]])  # (24,)
 
         # 4 selected waveforms, z-scored
-        waves = torch.from_numpy(
-            np.stack([g[f"waves/{k}"][:] for k in WAVE_KEYS_REDUCED]).astype(np.float32)
-        )
+        waves_raw = np.stack([g[f"waves/{k}"][:] for k in WAVE_KEYS_REDUCED]).astype(np.float32)
+        if self.noise_snr_db is not None:
+            # White Gaussian noise, SNR relative to each waveform's own power (variance about
+            # its own mean), matching Wehenkel et al.'s stochastic measurement model.
+            sig_power = waves_raw.var(axis=1, keepdims=True)
+            noise_std = np.sqrt(sig_power) / (10 ** (self.noise_snr_db / 20))
+            waves_raw = waves_raw + np.random.randn(*waves_raw.shape).astype(np.float32) * noise_std
+        waves = torch.from_numpy(waves_raw)
         waves = (waves - self.wave_mean) / (self.wave_std + 1e-8)  # (4, 201)
 
         # HR z-scored

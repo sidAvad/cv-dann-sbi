@@ -135,10 +135,12 @@ def gradient_penalty(critic: nn.Module, z_sim: torch.Tensor,
 # ─── Data loading ─────────────────────────────────────────────────────────────
 
 def load_sim_data(data_dir: Path, manifest: dict, stats: dict, n: int, log,
-                  include_sv: bool = True, scalar_norm: str = "legacy"):
+                  include_sv: bool = True, scalar_norm: str = "legacy",
+                  noise_snr_db: float | None = None):
     index   = manifest["index"][:n]
     dataset = ReducedCVDataset(str(data_dir), index, stats,
-                               include_sv=include_sv, scalar_norm=scalar_norm)
+                               include_sv=include_sv, scalar_norm=scalar_norm,
+                               noise_snr_db=noise_snr_db)
     loader  = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
     thetas, xs, loaded = [], [], 0
     for theta_b, x_b in loader:
@@ -269,6 +271,10 @@ def main():
     parser.add_argument("--manifest-train",  default="manifest_train.json",
                         help="Manifest filename under sim-data-root (default: manifest_train.json)")
     parser.add_argument("--n-sims",          type=int, default=None)
+    parser.add_argument("--noise-snr-db", type=float, default=None,
+                        help="If set, adds white Gaussian noise to sim waveforms at this SNR "
+                             "(dB), relative to each waveform's own power, before normalization "
+                             "-- matches Wehenkel et al.'s stochastic measurement model.")
     # Encoder
     parser.add_argument("--encoder-type",  choices=["lipschitz", "vae"], default="lipschitz")
     parser.add_argument("--latent-dim",    type=int,   default=128)
@@ -364,6 +370,7 @@ def main():
     log(f"Mixup: {'on' if args.use_mixup else 'off'}  alpha={args.mixup_alpha}")
     log(f"Encoder type: {args.encoder_type}"
         + (f"  kl_weight={args.kl_weight}" if args.encoder_type == "vae" else ""))
+    log(f"Noise model: {'off' if args.noise_snr_db is None else f'SNR={args.noise_snr_db}dB'}")
 
     # ── Load data ──────────────────────────────────────────────────────────────
     stats    = load_stats(Path(args.stats_path))
@@ -374,7 +381,7 @@ def main():
     log(f"Loading {n_sims} sim observations...")
     theta_all, x_all = load_sim_data(
         Path(args.sim_data_root) / "train", manifest, stats, n_sims, log,
-        include_sv=include_sv, scalar_norm=scalar_norm,
+        include_sv=include_sv, scalar_norm=scalar_norm, noise_snr_db=args.noise_snr_db,
     )
 
     real_stats = None
