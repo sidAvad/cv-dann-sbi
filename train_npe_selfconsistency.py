@@ -243,7 +243,7 @@ def main():
     flow_lik = build_flow(
         target_dim=args.latent_dim, condition_dim=N_PARAMS_INFER,
         hidden_features=args.lik_hidden_features, num_transforms=args.lik_num_transforms,
-        z_score_target="none", z_score_condition="independent",
+        z_score_target="independent", z_score_condition="independent",
         target_batch=h_seed, condition_batch=theta_seed,
     ).to(DEVICE)
     log(f"Likelihood flow params: {sum(p.numel() for p in flow_lik.parameters()):,}")
