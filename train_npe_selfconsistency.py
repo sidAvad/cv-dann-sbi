@@ -36,8 +36,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.multiprocessing
 import torch.nn as nn
 from torch.utils.data import DataLoader
+
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 from sbi.neural_nets import posterior_nn
 
