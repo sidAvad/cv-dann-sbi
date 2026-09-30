@@ -157,6 +157,15 @@ def main():
     parser.add_argument("--lik-num-transforms", type=int, default=8)
     # Self-consistency
     parser.add_argument("--sc-k", type=int, default=10, help="theta_k samples per x for L_SC")
+    parser.add_argument("--lam-nle", type=float, default=0.2,
+                        help="Weight on the standalone L_NLE term. NLL magnitude scales with "
+                             "target dimensionality -- q_eta's target (h(x), 128-dim) is "
+                             "structurally larger than q_phi's (theta, 24-dim), so unweighted "
+                             "(1.0/1.0) summing lets L_NLE dominate the shared encoder's "
+                             "gradient even in normal training, well before any divergence. "
+                             "Does not touch L_SC's internal log_qeta term -- that needs the "
+                             "true, unscaled log-density to correctly represent the Bayes' "
+                             "rule consistency identity.")
     parser.add_argument("--lam-sc-max", type=float, default=1.0)
     parser.add_argument("--sc-warmup", type=int, default=50, help="epochs into joint phase before L_SC ramp starts")
     parser.add_argument("--sc-ramp", type=int, default=50, help="epochs to ramp lambda_sc 0 -> max")
@@ -205,6 +214,7 @@ def main():
     log(f"Phase boundaries — flow_end={flow_end}  enc_end={enc_end}  max={args.max_epochs}")
     log(f"Self-consistency: K={args.sc_k}  lam_sc_max={args.lam_sc_max}  "
         f"sc_warmup={args.sc_warmup}  sc_ramp={args.sc_ramp}")
+    log(f"lam_nle={args.lam_nle}  grad_clip={args.grad_clip} (per-network)")
     log(f"Posterior flow: hidden={args.hidden_features}  transforms={args.num_transforms}")
     log(f"Likelihood flow: hidden={args.lik_hidden_features}  transforms={args.lik_num_transforms}")
 
@@ -264,7 +274,7 @@ def main():
         likelihood_flow=dict(hidden_features=args.lik_hidden_features, num_transforms=args.lik_num_transforms,
                               n_params=sum(p.numel() for p in flow_lik.parameters())),
         self_consistency=dict(k=args.sc_k, lam_sc_max=args.lam_sc_max,
-                               sc_warmup=args.sc_warmup, sc_ramp=args.sc_ramp),
+                               sc_warmup=args.sc_warmup, sc_ramp=args.sc_ramp, lam_nle=args.lam_nle),
         data=dict(n_sims=n_sims, sim_data_root=args.sim_data_root),
         schedule=dict(flow_end=flow_end, enc_end=enc_end, max_epochs=args.max_epochs),
         training=dict(lr=args.lr, batch_size=args.batch_size, grad_clip=args.grad_clip),
@@ -318,13 +328,21 @@ def main():
                 l_sc = torch.zeros((), device=DEVICE)
 
             if phase == 0:
-                loss = l_npe + l_nle
+                loss = l_npe + args.lam_nle * l_nle
             else:
-                loss = l_npe + l_nle + lam_sc * l_sc
+                loss = l_npe + args.lam_nle * l_nle + lam_sc * l_sc
 
             opt.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(all_params, args.grad_clip)
+            # Clipped per-network, not globally: a global clip_grad_norm_ over all_params
+            # computes ONE norm across every parameter, so if flow_lik's raw gradient blows
+            # up, the resulting scale factor gets applied uniformly to encoder/flow_post's
+            # gradients too -- crushing their already-small, legitimate gradients toward zero
+            # rather than just taming flow_lik's own. Clipping each network's parameters
+            # against its own norm keeps flow_lik's instability from starving the others.
+            torch.nn.utils.clip_grad_norm_(encoder.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(flow_post.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(flow_lik.parameters(), args.grad_clip)
             opt.step()
 
             ep_npe += l_npe.item(); ep_nle += l_nle.item()
