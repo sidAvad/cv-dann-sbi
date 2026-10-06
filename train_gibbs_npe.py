@@ -364,7 +364,9 @@ def main():
     # ── Model: E + flow conditioned on [E(x), WEmbed(log w)] ─────────────────
     theta_all = sim_theta[:min(10_000, len(sim_theta))]
     if args.resume_dir:
-        E = torch.load(src / "encoder.pt", weights_only=False).to(device)
+        E = LipschitzReducedAutoencoderEncoder(latent_dim=args.latent_dim, sn_ceiling=2.0,
+                                               proj_hidden=None, n_scalars=N_SCALARS).to(device)
+        E.load_state_dict(torch.load(src / "encoder.pt", map_location=device))
         flow = torch.load(src / "flow_net.pt", weights_only=False).to(device)
         wemb = torch.load(src / "w_embed.pt", weights_only=False).to(device)
     else:
@@ -431,7 +433,7 @@ def main():
         log(f"ep {epoch:4d} [{ph:4s}]  train_nll {train_nll:.4f}  ({dt:.0f}s)")
         last_epoch = epoch
 
-    torch.save(E, ckpt_dir / "encoder.pt")
+    torch.save(E.state_dict(), ckpt_dir / "encoder.pt")
     torch.save(flow, ckpt_dir / "flow_net.pt")
     torch.save(wemb, ckpt_dir / "w_embed.pt")
     torch.save(opt.state_dict(), ckpt_dir / "opt_state.pt")
