@@ -25,6 +25,7 @@ the normalization scale.
 import argparse
 import csv
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -262,6 +263,22 @@ class WEmbed(nn.Module):
         return self.net((log_w - self.center) / self.half_width)
 
 
+def save_snapshot(dst, E, flow, wemb, ckpt_dir, gibbs_meta, epoch):
+    """Mid-training snapshot, in the same format load_gibbs_models expects.
+
+    Written INSIDE the run's own checkpoint dir, so resolve_gibbs_ckpt -- which globs
+    one level under checkpoints/ and takes the last -- keeps resolving to the run
+    itself and never to a snapshot.
+    """
+    dst.mkdir(parents=True, exist_ok=True)
+    torch.save(E.state_dict(), dst / "encoder.pt")
+    torch.save(flow, dst / "flow_net.pt")
+    torch.save(wemb, dst / "w_embed.pt")
+    shutil.copy2(ckpt_dir / "gibbs_metric.npz", dst / "gibbs_metric.npz")
+    with open(dst / "gibbs_metric.json", "w") as f:
+        json.dump({**gibbs_meta, "last_epoch": epoch}, f, indent=2)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -285,6 +302,10 @@ def main():
     parser.add_argument("--latent-dim", type=int, default=128)
     parser.add_argument("--stats-path", default="norm_stats.json")
     parser.add_argument("--outputs-root", default="/home/sa4604/outputs/cv-sbi-spin")
+    parser.add_argument("--ckpt-every", type=int, default=0,
+                        help="snapshot encoder/flow/w_embed every N epochs into "
+                             "<ckpt_dir>/epoch<NNNN>/, for tracking a metric against "
+                             "training epoch. 0 disables.")
     parser.add_argument("--resume-dir", default=None,
                         help="Checkpoint dir (checkpoints/<ts>) of a previous run to continue. "
                              "Reuses its metric and w_hat; epochs continue from its last epoch.")
@@ -432,6 +453,11 @@ def main():
         csv_fh.flush()
         log(f"ep {epoch:4d} [{ph:4s}]  train_nll {train_nll:.4f}  ({dt:.0f}s)")
         last_epoch = epoch
+
+        if args.ckpt_every and epoch % args.ckpt_every == 0:
+            save_snapshot(ckpt_dir / f"epoch{epoch:04d}", E, flow, wemb,
+                          ckpt_dir, gibbs_meta, epoch)
+            log(f"       snapshot -> epoch{epoch:04d}")
 
     torch.save(E.state_dict(), ckpt_dir / "encoder.pt")
     torch.save(flow, ckpt_dir / "flow_net.pt")
