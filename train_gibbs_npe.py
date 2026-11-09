@@ -45,6 +45,7 @@ from dataset import (
 )
 from models import LipschitzReducedAutoencoderEncoder
 from train_joint import build_flow_net, load_real_beats
+from bounded_nsf import build_bounded_nsf
 
 WAVE_LEN = NW * T
 MATERN_LAGS = 40
@@ -302,6 +303,15 @@ def main():
     parser.add_argument("--latent-dim", type=int, default=128)
     parser.add_argument("--stats-path", default="norm_stats.json")
     parser.add_argument("--outputs-root", default="/home/sa4604/outputs/cv-sbi-spin")
+    parser.add_argument("--flow-arch", choices=["maf", "bounded-nsf"], default="maf",
+                        help="maf: the unconstrained Gaussian-base flow. bounded-nsf: "
+                             "rational-quadratic splines on the prior box, so every "
+                             "draw is in-prior by construction (see bounded_nsf.py)")
+    parser.add_argument("--nsf-bins", type=int, default=10)
+    parser.add_argument("--nsf-transforms", type=int, default=8)
+    parser.add_argument("--nsf-hidden", type=int, default=256)
+    parser.add_argument("--nested-sim-root", default="/home/sa4604/projects/nested-sim",
+                        help="source of the prior box (bounded-nsf only)")
     parser.add_argument("--ckpt-every", type=int, default=0,
                         help="snapshot encoder/flow/w_embed every N epochs into "
                              "<ckpt_dir>/epoch<NNNN>/, for tracking a metric against "
@@ -371,7 +381,8 @@ def main():
 
     lo, hi = np.log(w_hat / 10.0), np.log(10.0 * w_hat)
     gibbs_meta = {**metric.to_dict(), "w_hat": w_hat, "w_log_range": [lo, hi],
-                  "last_epoch": start_epoch - 1, "resumed_from": args.resume_dir}
+                  "last_epoch": start_epoch - 1, "resumed_from": args.resume_dir,
+                  "flow_arch": args.flow_arch}
     if not args.resume_dir:
         gibbs_meta["calib_info"] = cal_info
         gibbs_meta["calib_patients"] = [real_files[i] for i in cal_idx]
@@ -394,8 +405,24 @@ def main():
         E = LipschitzReducedAutoencoderEncoder(latent_dim=args.latent_dim, sn_ceiling=2.0,
                                                proj_hidden=None, n_scalars=N_SCALARS).to(device)
         wemb = WEmbed(center=(lo + hi) / 2, half_width=(hi - lo) / 2).to(device)
-        flow = build_flow_net("maf", args.latent_dim + W_EMBED_DIM, theta_all,
-                              hidden_features=128, num_transforms=5).to(device)
+        if args.flow_arch == "bounded-nsf":
+            sys.path.insert(0, args.nested_sim_root)
+            from nested_sim.params import (THETA_BOUNDS, LOG_SAMPLED,  # noqa: E402
+                                           to_binary_names)
+            bb = to_binary_names(THETA_BOUNDS)
+            theta_lo = [bb[k][0] for k in PARAM_KEYS_INFER]
+            theta_hi = [bb[k][1] for k in PARAM_KEYS_INFER]
+            log_dims = [PARAM_KEYS_INFER.index(k)
+                        for k in to_binary_names({k: 0 for k in LOG_SAMPLED})]
+            flow = build_bounded_nsf(args.latent_dim + W_EMBED_DIM, theta_lo, theta_hi,
+                                     log_dims, num_bins=args.nsf_bins,
+                                     num_transforms=args.nsf_transforms,
+                                     hidden_features=args.nsf_hidden).to(device)
+            log(f"flow: bounded NSF, {args.nsf_transforms} transforms x "
+                f"{args.nsf_bins} bins, {len(log_dims)} log dims")
+        else:
+            flow = build_flow_net("maf", args.latent_dim + W_EMBED_DIM, theta_all,
+                                  hidden_features=128, num_transforms=5).to(device)
     flow_params = list(flow.parameters()) + list(wemb.parameters())
     opt = torch.optim.Adam(list(E.parameters()) + flow_params, lr=args.lr)
     if args.resume_dir:
