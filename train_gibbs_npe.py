@@ -319,6 +319,11 @@ def main():
     parser.add_argument("--resume-dir", default=None,
                         help="Checkpoint dir (checkpoints/<ts>) of a previous run to continue. "
                              "Reuses its metric and w_hat; epochs continue from its last epoch.")
+    parser.add_argument("--sn-ceiling", type=float, default=2.0,
+                        help="Per-layer spectral-norm ceiling on the encoder. The "
+                             "parametrization scales a layer by min(1, ceiling/sigma_1), "
+                             "so a very large value (e.g. inf) is an exact no-op. Ignored "
+                             "on --resume-dir, which keeps the source run's architecture.")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -367,7 +372,7 @@ def main():
     start_epoch = 1
     if args.resume_dir:
         src = Path(args.resume_dir)
-        meta = json.load(open(src / "gibbs_metric.json"))
+        meta = src_meta = json.load(open(src / "gibbs_metric.json"))
         metric = Metric.from_npz(src / "gibbs_metric.npz", meta["ell"])
         w_hat = meta["w_hat"]
         start_epoch = meta["last_epoch"] + 1
@@ -382,7 +387,9 @@ def main():
     lo, hi = np.log(w_hat / 10.0), np.log(10.0 * w_hat)
     gibbs_meta = {**metric.to_dict(), "w_hat": w_hat, "w_log_range": [lo, hi],
                   "last_epoch": start_epoch - 1, "resumed_from": args.resume_dir,
-                  "flow_arch": args.flow_arch}
+                  "flow_arch": args.flow_arch,
+                  "sn_ceiling": (src_meta.get("sn_ceiling", 2.0) if args.resume_dir
+                                 else args.sn_ceiling)}
     if not args.resume_dir:
         gibbs_meta["calib_info"] = cal_info
         gibbs_meta["calib_patients"] = [real_files[i] for i in cal_idx]
@@ -396,13 +403,17 @@ def main():
     # ── Model: E + flow conditioned on [E(x), WEmbed(log w)] ─────────────────
     theta_all = sim_theta[:min(10_000, len(sim_theta))]
     if args.resume_dir:
-        E = LipschitzReducedAutoencoderEncoder(latent_dim=args.latent_dim, sn_ceiling=2.0,
+        # a resume reproduces the source run's encoder exactly; --sn-ceiling does not
+        # apply here, since a different ceiling is a different model
+        E = LipschitzReducedAutoencoderEncoder(latent_dim=args.latent_dim,
+                                               sn_ceiling=src_meta.get("sn_ceiling", 2.0),
                                                proj_hidden=None, n_scalars=N_SCALARS).to(device)
         E.load_state_dict(torch.load(src / "encoder.pt", map_location=device))
         flow = torch.load(src / "flow_net.pt", weights_only=False).to(device)
         wemb = torch.load(src / "w_embed.pt", weights_only=False).to(device)
     else:
-        E = LipschitzReducedAutoencoderEncoder(latent_dim=args.latent_dim, sn_ceiling=2.0,
+        E = LipschitzReducedAutoencoderEncoder(latent_dim=args.latent_dim,
+                                               sn_ceiling=args.sn_ceiling,
                                                proj_hidden=None, n_scalars=N_SCALARS).to(device)
         wemb = WEmbed(center=(lo + hi) / 2, half_width=(hi - lo) / 2).to(device)
         if args.flow_arch == "bounded-nsf":
