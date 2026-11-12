@@ -344,11 +344,13 @@ def main():
                              "parametrization scales a layer by min(1, ceiling/sigma_1), "
                              "so a very large value (e.g. inf) is an exact no-op. Ignored "
                              "on --resume-dir, which keeps the source run's architecture.")
-    parser.add_argument("--cond-mode", default="encoder", choices=["encoder", "phi"],
+    parser.add_argument("--cond-mode", default="encoder",
+                        choices=["encoder", "phi", "concat"],
                         help="What the flow is conditioned on, alongside WEmbed(log w). "
                              "encoder: the learned latent E(x). phi: the metric's own "
                              "whitened feature vector phi(x), which the Gibbs likelihood "
-                             "is defined on, so no encoder is built or trained.")
+                             "is defined on, so no encoder is built or trained. concat: "
+                             "both, as [E(x), phi(x)] in that order.")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -425,19 +427,26 @@ def main():
     with open(ckpt_dir / "gibbs_metric.json", "w") as f:
         json.dump(gibbs_meta, f, indent=2)
 
-    # ── Model: flow conditioned on [E(x) or phi(x), WEmbed(log w)] ───────────
+    # ── Model: flow conditioned on [E(x)?, phi(x)?, WEmbed(log w)] ──────────
     theta_all = sim_theta[:min(10_000, len(sim_theta))]
-    phi_cond = args.cond_mode == "phi"
-    cond_dim = (metric.d_eff if phi_cond else args.latent_dim) + W_EMBED_DIM
+    # conditioning order is fixed as [E(x), phi(x), WEmbed(log w)]; a checkpoint is only
+    # loadable under the cond_mode it was trained with, which gibbs_metric.json records
+    use_enc = args.cond_mode in ("encoder", "concat")
+    use_phi = args.cond_mode in ("phi", "concat")
+    cond_dim = ((args.latent_dim if use_enc else 0)
+                + (metric.d_eff if use_phi else 0) + W_EMBED_DIM)
     if args.resume_dir and src_meta.get("cond_mode", "encoder") != args.cond_mode:
         raise SystemExit(f"--resume-dir was trained with cond_mode "
                          f"{src_meta.get('cond_mode', 'encoder')!r}, not "
                          f"{args.cond_mode!r}; that is a different model")
+    log(f"conditioning: {args.cond_mode}  cond_dim={cond_dim} "
+        f"(E {args.latent_dim if use_enc else 0} + phi {metric.d_eff if use_phi else 0} "
+        f"+ w {W_EMBED_DIM})")
     if args.resume_dir:
         # a resume reproduces the source run's encoder exactly; --sn-ceiling does not
         # apply here, since a different ceiling is a different model
         E = None
-        if not phi_cond:
+        if use_enc:
             E = LipschitzReducedAutoencoderEncoder(latent_dim=args.latent_dim,
                                                    sn_ceiling=src_meta.get("sn_ceiling", 2.0),
                                                    proj_hidden=None, n_scalars=N_SCALARS).to(device)
@@ -445,9 +454,9 @@ def main():
         flow = torch.load(src / "flow_net.pt", weights_only=False).to(device)
         wemb = torch.load(src / "w_embed.pt", weights_only=False).to(device)
     else:
-        E = None if phi_cond else LipschitzReducedAutoencoderEncoder(
+        E = LipschitzReducedAutoencoderEncoder(
             latent_dim=args.latent_dim, sn_ceiling=args.sn_ceiling,
-            proj_hidden=None, n_scalars=N_SCALARS).to(device)
+            proj_hidden=None, n_scalars=N_SCALARS).to(device) if use_enc else None
         wemb = WEmbed(center=(lo + hi) / 2, half_width=(hi - lo) / 2).to(device)
         if args.flow_arch == "bounded-nsf":
             sys.path.insert(0, args.nested_sim_root)
@@ -481,7 +490,7 @@ def main():
     enc_end = flow_end + args.enc_warmup
 
     def phase(epoch):
-        if phi_cond:
+        if not use_enc:
             return "phi"
         if epoch <= flow_end:
             return "flow"
@@ -516,8 +525,12 @@ def main():
             theta, x = theta.to(device, non_blocking=True), x.to(device, non_blocking=True)
             log_w = lo + (hi - lo) * torch.rand(x.shape[0], 1, device=device)
             x_noisy = noisy_obs(x, log_w, m_t, o_t)
-            h = phi_torch(x_noisy, m_t, o_t) if phi_cond else E(x_noisy)
-            cond = torch.cat([h, wemb(log_w)], 1)
+            parts = []
+            if use_enc:
+                parts.append(E(x_noisy))
+            if use_phi:
+                parts.append(phi_torch(x_noisy, m_t, o_t))
+            cond = torch.cat(parts + [wemb(log_w)], 1)
             loss = -flow.log_prob(theta, condition=cond).mean()
             opt.zero_grad(set_to_none=True)
             loss.backward()
