@@ -339,6 +339,19 @@ def main():
     parser.add_argument("--resume-dir", default=None,
                         help="Checkpoint dir (checkpoints/<ts>) of a previous run to continue. "
                              "Reuses its metric and w_hat; epochs continue from its last epoch.")
+    parser.add_argument("--n-val-sims", type=int, default=4096,
+                        help="Held-out sims for the validation NLL, taken from the "
+                             "manifest entries AFTER the --n-sims training slice, so "
+                             "they are never trained on. 0 disables validation.")
+    parser.add_argument("--val-every", type=int, default=1,
+                        help="Compute the validation NLL every N epochs.")
+    parser.add_argument("--val-seed", type=int, default=1234,
+                        help="Seed for the validation set's log w draw and its noise. The "
+                             "noised validation batch is built ONCE and reused every epoch, "
+                             "so val_nll is comparable across epochs and across runs; "
+                             "resampling it per epoch would add the same per-epoch scatter "
+                             "that makes train_nll noisy.")
+    parser.add_argument("--val-batch", type=int, default=512)
     parser.add_argument("--sn-ceiling", type=float, default=2.0,
                         help="Per-layer spectral-norm ceiling on the encoder. The "
                              "parametrization scales a layer by min(1, ceiling/sigma_1), "
@@ -385,6 +398,16 @@ def main():
     log(f"Loading {args.n_sims} sim observations...")
     sim_theta, sim_x_t = load_sim_tensors(sim_root / "train", manifest["index"][:args.n_sims], stats, log)
     sim_x = sim_x_t.numpy()
+
+    val_idx = manifest["index"][args.n_sims:args.n_sims + args.n_val_sims]
+    if args.n_val_sims and not val_idx:
+        log(f"WARNING no held-out sims past --n-sims {args.n_sims} "
+            f"({len(manifest['index'])} in manifest); validation disabled")
+    val_theta, val_x_t = (load_sim_tensors(sim_root / "train", val_idx, stats, log)
+                          if val_idx else (None, None))
+    if val_idx:
+        log(f"Validation: {len(val_idx)} held-out sims (manifest "
+            f"{args.n_sims}..{args.n_sims + len(val_idx) - 1})")
 
     real_x_t = load_real_beats(Path(args.real_data), stats, log)
     real_files = [fp.stem for fp in sorted(Path(args.real_data).glob("*.h5"))]
@@ -486,6 +509,38 @@ def main():
                         num_workers=0, pin_memory=True, drop_last=True)
     m_t, o_t = metric_to_torch(metric, obs, device)
 
+    # One fixed (log w, noise) realisation, drawn in a forked RNG so the training stream
+    # is untouched. log w uses the same U[log(w_hat/10), log(10 w_hat)] prior the training
+    # loss averages over, so val_nll and train_nll are the same quantity on different data.
+    val_pack = None
+    if val_x_t is not None:
+        with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+            torch.manual_seed(args.val_seed)
+            vx = val_x_t.to(device)
+            vlog_w = lo + (hi - lo) * torch.rand(vx.shape[0], 1, device=device)
+            val_pack = (val_theta.to(device), noisy_obs(vx, vlog_w, m_t, o_t), vlog_w)
+            del vx
+
+    def val_nll_now():
+        """Mean NLL on the held-out slice, under the fixed noised batch."""
+        th, xn, lw = val_pack
+        if E is not None:
+            E.eval()
+        flow.eval(); wemb.eval()
+        tot, cnt = 0.0, 0
+        with torch.no_grad():
+            for b in range(0, th.shape[0], args.val_batch):
+                t_b, x_b, w_b = th[b:b + args.val_batch], xn[b:b + args.val_batch], lw[b:b + args.val_batch]
+                parts = []
+                if use_enc:
+                    parts.append(E(x_b))
+                if use_phi:
+                    parts.append(phi_torch(x_b, m_t, o_t))
+                c = torch.cat(parts + [wemb(w_b)], 1)
+                tot += -flow.log_prob(t_b, condition=c).sum().item()
+                cnt += t_b.shape[0]
+        return tot / cnt
+
     flow_end = args.flow_warmup
     enc_end = flow_end + args.enc_warmup
 
@@ -500,7 +555,7 @@ def main():
 
     csv_fh = open(run_dir / f"train_log_{ts}.csv", "w", newline="")
     writer = csv.writer(csv_fh)
-    writer.writerow(["epoch", "phase", "train_nll", "seconds"])
+    writer.writerow(["epoch", "phase", "train_nll", "val_nll", "seconds"])
 
     gibbs_meta_path = ckpt_dir / "gibbs_metric.json"
     log(f"Training: epochs {start_epoch}-{args.max_epochs}, {len(sim_dl)} batches/epoch, lr={args.lr}, "
@@ -538,10 +593,14 @@ def main():
             opt.step()
             total += loss.item() * x.shape[0]; n += x.shape[0]
         train_nll = total / n
+        v = (val_nll_now() if val_pack is not None and args.val_every
+             and epoch % args.val_every == 0 else None)
         dt = time.time() - t0
-        writer.writerow([epoch, ph, f"{train_nll:.5f}", f"{dt:.1f}"])
+        writer.writerow([epoch, ph, f"{train_nll:.5f}",
+                         "" if v is None else f"{v:.5f}", f"{dt:.1f}"])
         csv_fh.flush()
-        log(f"ep {epoch:4d} [{ph:4s}]  train_nll {train_nll:.4f}  ({dt:.0f}s)")
+        log(f"ep {epoch:4d} [{ph:4s}]  train_nll {train_nll:.4f}"
+            + ("" if v is None else f"  val_nll {v:.4f}") + f"  ({dt:.0f}s)")
         last_epoch = epoch
 
         if args.ckpt_every and epoch % args.ckpt_every == 0:
@@ -561,7 +620,9 @@ def main():
     with open(run_info_path) as f:
         info = json.load(f)
     info.update({"status": "complete", "w_hat": w_hat, "d_eff": metric.d_eff,
-                 "last_epoch": last_epoch, "n_sims": len(sim_theta), "checkpoint": ts})
+                 "last_epoch": last_epoch, "n_sims": len(sim_theta), "checkpoint": ts,
+                 "n_val_sims": (0 if val_pack is None else int(val_pack[0].shape[0])),
+                 "val_seed": args.val_seed})
     with open(run_info_path, "w") as f:
         json.dump(info, f, indent=2)
     log(f"Saved checkpoint to {ckpt_dir}")
