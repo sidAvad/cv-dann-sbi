@@ -36,6 +36,8 @@ def main():
     p.add_argument("--stats-path", default="/home/sa4604/outputs/nested-sim/data/lofi_train/norm_stats.json")
     p.add_argument("--nested-sim-root", default="/home/sa4604/projects/nested-sim")
     p.add_argument("--n-sims", type=int, default=20_000)
+    p.add_argument("--ks-report", action="store_true",
+                   help="print the per-dim KS statistic for all 24 theta dims")
     a = p.parse_args()
 
     d = RD.build_base(a.sim_data_root, a.stats_path, a.n_sims, 256,
@@ -84,15 +86,24 @@ def main():
     # This is what makes tempering the joint score equivalent to the intended power
     # posterior (REPRESENTATION.md section 2). If the bank were not log-uniform on the
     # log dims, those three would fail here.
-    worst = (None, 0.0)
+    ks_all = []
     for j in range(RD.THETA_DIM):
         u = np.sort(theta_u[:, j].numpy())
-        ks = float(np.abs(np.arange(1, len(u) + 1) / len(u) - u).max())
-        if ks > worst[1]:
-            worst = (PARAM_KEYS_INFER[j], ks)
-    crit = 1.63 / np.sqrt(a.n_sims)          # ~99% KS critical value
-    check("every theta dim is uniform in unit-cube coords (KS)", worst[1] < crit,
-          f"worst {worst[0]} D={worst[1]:.4f} vs crit {crit:.4f}")
+        ks_all.append((PARAM_KEYS_INFER[j],
+                       float(np.abs(np.arange(1, len(u) + 1) / len(u) - u).max())))
+    ks_all.sort(key=lambda kv: -kv[1])
+    # 24 dims are tested at once, so the threshold is Bonferroni-corrected to a
+    # family-wise 1%: P(D > d) ~ 2 exp(-2 n d^2)  =>  d = sqrt(ln(2/alpha) / 2n).
+    alpha = 0.01 / RD.THETA_DIM
+    crit = float(np.sqrt(np.log(2 / alpha) / (2 * a.n_sims)))
+    check("every theta dim is uniform in unit-cube coords (KS, Bonferroni 1%)",
+          ks_all[0][1] < crit,
+          f"worst {ks_all[0][0]} D={ks_all[0][1]:.5f} vs crit {crit:.5f} "
+          f"(next: {ks_all[1][0]} {ks_all[1][1]:.5f})")
+    if a.ks_report:
+        print("      per-dim KS D, descending:")
+        for nm, v in ks_all:
+            print(f"        {nm:>12s}  {v:.5f}  {'*' if v > crit else ''}")
 
     # ---- hr_z is held exact by both of our masked functions ----------------
     m = RN._clean_mask(RD.X_DIM, RN.CLEAN_X_DIMS, torch.device("cpu"), torch.float32)
