@@ -339,6 +339,16 @@ def main():
     parser.add_argument("--resume-dir", default=None,
                         help="Checkpoint dir (checkpoints/<ts>) of a previous run to continue. "
                              "Reuses its metric and w_hat; epochs continue from its last epoch.")
+    parser.add_argument("--metric-dir", default=None,
+                        help="Checkpoint dir (checkpoints/<ts>) to load a frozen metric M and "
+                             "w_hat from, WITHOUT resuming weights, optimizer state, or the "
+                             "epoch counter. Keeps M fixed across runs; training starts fresh.")
+    parser.add_argument("--w-lo", type=float, default=None,
+                        help="Lower end of the log-uniform w training range, in absolute "
+                             "units. Must be given with --w-hi. Default: w_hat/10.")
+    parser.add_argument("--w-hi", type=float, default=None,
+                        help="Upper end of the log-uniform w training range, in absolute "
+                             "units. Must be given with --w-lo. Default: 10*w_hat.")
     parser.add_argument("--n-val-sims", type=int, default=4096,
                         help="Held-out sims for the validation NLL, taken from the "
                              "manifest entries AFTER the --n-sims training slice, so "
@@ -428,20 +438,38 @@ def main():
         start_epoch = meta["last_epoch"] + 1
         log(f"Resuming from {src}: reusing metric (ell={metric.ell:.2f}, k_t={metric.k}) and "
             f"w_hat={w_hat:.6g}; epochs continue from {start_epoch}")
+    elif args.metric_dir:
+        mdir = Path(args.metric_dir)
+        mmeta = json.load(open(mdir / "gibbs_metric.json"))
+        metric = Metric.from_npz(mdir / "gibbs_metric.npz", mmeta["ell"])
+        w_hat = mmeta["w_hat"]
+        log(f"Frozen metric from {mdir}: ell={metric.ell:.4f}, k_t={metric.k}, "
+            f"d_eff={mmeta['d_eff']}, w_hat={w_hat:.6g}; weights train from scratch")
     else:
         log("Stage 1-2: estimating metric M and w_hat on calibration patients...")
         metric, w_hat, cal_info = estimate_metric(sim_x, obs, cal_x, log=log)
         log(f"  w_hat = {w_hat:.6g}   training range [{w_hat/10:.4g}, {10*w_hat:.4g}]")
         check_noise_consistency(sim_x, obs, metric, w_hat, log=log)
 
-    lo, hi = np.log(w_hat / 10.0), np.log(10.0 * w_hat)
+    if (args.w_lo is None) != (args.w_hi is None):
+        raise SystemExit("--w-lo and --w-hi must be given together")
+    if args.w_lo is not None:
+        if not 0 < args.w_lo < args.w_hi:
+            raise SystemExit(f"need 0 < --w-lo < --w-hi, got {args.w_lo}, {args.w_hi}")
+        lo, hi = np.log(args.w_lo), np.log(args.w_hi)
+        log(f"w training range (explicit): [{args.w_lo:g}, {args.w_hi:g}]  "
+            f"(w_hat={w_hat:.6g} is recorded but does not set the range)")
+    else:
+        lo, hi = np.log(w_hat / 10.0), np.log(10.0 * w_hat)
     gibbs_meta = {**metric.to_dict(), "w_hat": w_hat, "w_log_range": [lo, hi],
                   "last_epoch": start_epoch - 1, "resumed_from": args.resume_dir,
+                  "metric_from": args.metric_dir,
                   "flow_arch": args.flow_arch, "cond_mode": args.cond_mode,
                   "sn_ceiling": (src_meta.get("sn_ceiling", 2.0) if args.resume_dir
                                  else args.sn_ceiling)}
-    if not args.resume_dir:
+    if not (args.resume_dir or args.metric_dir):
         gibbs_meta["calib_info"] = cal_info
+    if not args.resume_dir:
         gibbs_meta["calib_patients"] = [real_files[i] for i in cal_idx]
         gibbs_meta["test_patients"] = [real_files[i] for i in test_idx]
     np.savez(ckpt_dir / "gibbs_metric.npz", V=metric.V, eigvals=metric.lam,
