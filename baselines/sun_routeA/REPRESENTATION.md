@@ -68,6 +68,14 @@ support a box-uniform prior is a constant `c`, so
 -- identical to the intended power posterior up to normalisation. No correction term is
 needed and none is missing.
 
+**Verified empirically**, since the argument rests on the prior actually being flat in the
+Langevin coordinates: per-dimension KS tests against U(0,1) on the unit-cube theta pass at
+a Bonferroni-corrected family-wise 1% for all 24 dims. The worst statistic scales as
+1/sqrt(n) (tau_a: D = 0.01194 at n = 20k -> 0.00747 at n = 50k, against 0.00755 predicted
+by pure sampling noise) and the identity of the worst dim changes with n, both of which
+rule out a real distortion -- in particular there is no detectable survivorship bias from
+the bank holding only successful solves. `verify_phase1.py --ks-report`.
+
 **Off-support it is undefined.** `pi = 0` there, so the intended target is zero, but the
 score net is an extrapolating MLP and ULA has no reflecting barrier or projection. Nothing
 stops a chain leaving the prior box. So the correctness of this arm rests entirely on how
