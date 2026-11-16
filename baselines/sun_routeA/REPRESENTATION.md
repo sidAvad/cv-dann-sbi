@@ -40,6 +40,9 @@ and it gives the arm a sharpening range without us inventing numbers. Betas are
 independent, so (c) remains additive later -- new betas only need their own synthesis, not
 a redo.
 
+**Decided 2026-11-16: (b).** The grid is
+`[0.1, 0.2, ..., 1.0, 1.1, 1.3, 1.5]`, 13 values.
+
 ---
 
 ## 2. The released code has no Eq. 6 prior correction; it tempers the joint score
@@ -123,9 +126,33 @@ hard-codes a dimension -- verified by grep at the pinned commit.
 
 Both arms see the same input. Gibbs's `noisy_obs` perturbs the 804 waveform dims plus
 `sc[:, :4]` (MAP/SBP/DBP/SV) and passes `sc[:, 4] = hr_z` through untouched, so HR simply
-rides along as an un-noised dimension. Route A's DSM noises the same 808 and leaves
+rides along as an un-noised dimension.
+
+That exclusion is by design, not an oversight, and three things in the code agree: `e =
+torch.randn(B, 4)` draws only four scalar noises; `s_scal` has exactly four entries, so
+the metric has no HR component; and `d_eff = 180 = 4 waves x k_t 44 + 4 scalars` does not
+count it. The reason is that **HR is not inferred** -- `PARAM_KEYS_INFER` drops it, so it
+is a known covariate the simulator is conditioned on, carried in x so the network knows
+which heart rate the waveforms belong to. It is not a noisy observable to be matched, and
+the Gibbs metric has nothing to say about it. Route A's DSM noises the same 808 and leaves
 `hr_z` clean. The spec's separate HR-carrying machinery is dropped -- it was solving a
 problem that does not exist.
+
+**Implementation cost, accepted deliberately.** Upstream's `score_matching_loss` and
+`Lgmcmc` both touch all of x, and `vendor/` is not edited, so keeping `hr_z` clean means
+maintaining our own masked copies of those two functions in `routeA_noise.py`. This arm is
+therefore *not* bit-faithful to their code. The reason it is still the right call: `hr_z`
+is exact in the real observations both arms are evaluated on, so a noised `hr_z` would give
+Route A's synthesized pairs a wider spread in that dimension than the data it is tested
+against -- a train/test mismatch introduced by the method's own noise model rather than by
+the inference problem. Masking removes a confound instead of creating one. The step-size
+logic (`alpha_from_snr_blocks`) is imported from vendor unmodified; `x_dim` is still passed
+as 809 rather than 808 to stay closer to upstream, a ~0.1% difference in the x step.
+
+A second, smaller deviation lives in the same file: chains are initialised from a tensor
+(a slice of the lofi bank) rather than by calling `prior`/`simulator`, which is what makes
+the zero-new-simulations budget match in section 5 possible. Distributionally identical,
+since the bank is prior-drawn (theta, simulator(theta)) pairs.
 
 **One irreducible mismatch:** Gibbs noises SV *multiplicatively*
 (`sc[:,3:4] * exp(e*s_scal[3]*w^-0.5)`, because the metric works on log SV), while DSM is

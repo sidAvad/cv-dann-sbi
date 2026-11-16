@@ -51,16 +51,20 @@ langevin:                # RouteA_utils.Lgmcmc signature defaults
   cmax_x: 0.5
   per_sample_stepsize: false   # upstream default: batch-median step, chains coupled
 
-beta_grid: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-# ^ upstream's effective grid. NOTE: entirely <= 1.0, i.e. flattening only, no sharpening.
-#   See REPRESENTATION.md section 1 -- this is an open decision, not a settled one.
+# Upstream's shadowed line (RouteA_generate_pairs.py:106) un-shadowed: its 0.1..1.0 grid
+# plus the 1.1/1.3/1.5 top end from the assignment that line 107 overrides. Every value is
+# the authors' own. REPRESENTATION.md section 1, option (b).
+beta_grid: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.3, 1.5]
 
 synthesis:
-  # OURS: 980000 / 10 betas = 98000 chains per beta, initialised from a disjoint slice of
-  # the bank, so the 10 betas partition it exactly and consume zero new simulations.
-  n_per_beta: 98000
+  # OURS: 980000 / 13 betas = 75384 chains per beta from a disjoint slice of the bank, so
+  # the betas partition it and consume zero new simulations (8 rows unused, for equal
+  # per-beta counts).
+  n_per_beta: 75384
   init_from_bank: true
   bank_partition: disjoint
+  # x dims never noised or moved; hr_z is exact in the real observations both arms see.
+  clean_x_dims: [808]
 
 npe:                     # RouteB_utils.train_conditional_mdn / ConditionalMDN
   hidden: 128
