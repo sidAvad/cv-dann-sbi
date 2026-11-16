@@ -105,6 +105,18 @@ This is a reparameterisation of their algorithm, not a change to it, and it reus
 mapping already in the repo rather than introducing a new one. Our x is already z-scored
 and O(1), matching what `cmin_x=1e-2, cmax_x=0.5` assumes.
 
+**theta_dim and x_dim are not merely shape arguments here.** `alpha_from_snr_blocks`
+computes the step as `0.5 * d * tau^2 / (g2_median * beta^2)` before clamping, so
+`theta_dim` enters the step size directly: going from their 3 to our 24 makes the
+unclamped theta step 8x larger, and 840 -> 809 makes the x step ~4% smaller. Whether that
+matters depends on which side of the clamp the step lands on, which upstream never has to
+ask because its dimensions are fixed. **Log, per noise level, the fraction of steps that
+are clamp-bound vs SNR-bound.** If clamp-bound, the dimension change is irrelevant and
+the absolute clamps govern everything (section 3's argument for unit-cube coordinates is
+then the whole story); if SNR-bound, the 8x is real and the step schedule is effectively
+different from the one they tuned. Nothing else in the three library files we call
+hard-codes a dimension -- verified by grep at the pinned commit.
+
 ---
 
 ## 4. x is the identical 809-dim vector, with 808 noised and hr_z left clean
