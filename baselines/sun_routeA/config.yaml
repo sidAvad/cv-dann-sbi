@@ -1,0 +1,79 @@
+# Sun et al. Route A baseline -- faithful arm.
+# Every value under score_net/, dsm/, langevin/, beta_grid/ and npe/ is upstream's own
+# setting at commit 84049e98 (see VENDOR.md). Values we had to choose because upstream
+# hard-codes a different benchmark are marked OURS, with the reason.
+
+run_name: null          # set at launch; confirm with the user first
+
+data:
+  # OURS: reuse the existing 980k lofi bank -- the same pairs Gibbs NPE trains on, so the
+  # simulation budget is identical and no new sims are needed.
+  bank: /home/sa4604/outputs/nested-sim/data/lofi_train_for_gibbs
+  stats: /home/sa4604/outputs/nested-sim/data/lofi_train/norm_stats.json
+  n_sims: 980000
+  theta_dim: 24          # PARAM_KEYS_INFER (HR dropped)
+  x_dim: 809             # 4x201 z-scored waves + 5 scalars
+  # OURS: unit-cube coords for theta (prior box -> [0,1]^24, log for Emax_RV/Eap/Rap).
+  # Required, not cosmetic -- see REPRESENTATION.md sections 2 and 3.
+  theta_coords: unit_cube
+
+score_net:               # NSEutils.ScoreNet_sigma
+  amortize: true
+  emb_dim: 128
+  sigma_emb_dim: 128
+  hidden_dim: 128
+  sigma_min: 1.0e-2      # must track dsm.gamma_min (SigmaEmbedding normalises by these)
+  sigma_max: 1.0
+
+dsm:                     # RouteA_generate_pairs.py lines 34-58
+  T: 10
+  gamma_min: 1.0e-2
+  gamma_max: 1.0
+  direction: increasing
+  optimizer: adamw
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  scheduler: {type: steplr, step_size: 10, gamma: 0.95}
+  epochs: 1500
+  batch_size: 1024
+  val_fraction: 0.10
+  grad_clip: 1.0
+  early_stop: {patience: 100, min_delta: 1.0e-5, warmup_epochs: 500}
+
+langevin:                # RouteA_utils.Lgmcmc signature defaults
+  initial_step: 10
+  step_increase: 10      # -> 10+20+...+100 = 550 steps per chain
+  tau_theta: 0.5
+  tau_x: 0.5
+  cmin_theta: 2.0e-5
+  cmax_theta: 1.0e-4
+  cmin_x: 1.0e-2
+  cmax_x: 0.5
+  per_sample_stepsize: false   # upstream default: batch-median step, chains coupled
+
+beta_grid: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+# ^ upstream's effective grid. NOTE: entirely <= 1.0, i.e. flattening only, no sharpening.
+#   See REPRESENTATION.md section 1 -- this is an open decision, not a settled one.
+
+synthesis:
+  # OURS: 980000 / 10 betas = 98000 chains per beta, initialised from a disjoint slice of
+  # the bank, so the 10 betas partition it exactly and consume zero new simulations.
+  n_per_beta: 98000
+  init_from_bank: true
+  bank_partition: disjoint
+
+npe:                     # RouteB_utils.train_conditional_mdn / ConditionalMDN
+  hidden: 128
+  n_components: 8
+  n_hidden_layers: 2
+  batch_size: 512
+  epochs: 200
+  lr: 1.0e-3
+  grad_clip: 10.0
+  val_fraction: 0.10
+  patience: 20
+  logsigma_min: -7.0
+  logsigma_max: 10.0
+
+seed: 42                 # upstream SEED
+wandb: {enabled: false}  # upstream logs Route A to wandb; optional here
