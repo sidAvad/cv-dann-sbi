@@ -5,9 +5,13 @@ simulator's own joint -- the chains are even initialised from it. A classifier t
 the two apart is therefore a direct, assumption-free measure of how much the annealed
 Langevin distorted the joint. 0.5 means indistinguishable; 1.0 means trivially separable.
 
-Genuine rows are taken from the beta's own disjoint init slice, so the comparison is against
-exactly the rows those chains started from -- paired, not merely same-distribution. The
-classifier never sees a row in both classes.
+Genuine rows come from a DIFFERENT beta's init slice than the synthesized rows being tested.
+Using a beta's own init rows looks appealing (the comparison is then paired) but is invalid
+here: synthesized theta sits only ~0.056 from its initial row, so each synthesized row has a
+near-twin in the opposite class. The classifier memorises training rows and then mislabels
+their twins at test time, which drives accuracy *below* 0.5 -- measured at 0.367 on theta
+before this was fixed. The slices are disjoint by construction (see routeA_data.beta_partition),
+so a donor slice gives genuine rows that are same-distribution but not paired.
 
 Reported per beta, since beta=1 is the control and the off-one betas quantify how far the
 tempering moved the joint (if at all).
@@ -79,6 +83,9 @@ def main():
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--betas", default=None)
     p.add_argument("--out", default=None)
+    p.add_argument("--paired", action="store_true",
+                   help="use each beta's own init rows as the genuine class; invalid for "
+                        "theta (near-twin leakage), kept only to reproduce that artifact")
     a = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -96,7 +103,13 @@ def main():
             continue
         d = torch.load(f, weights_only=False)
         syn = d["rows"][:a.n]
-        gen = base["pairs"][torch.from_numpy(d["init_idx"][:a.n])]
+        if a.paired:
+            gen_idx = d["init_idx"][:a.n]
+        else:
+            donor = (betas.index(beta) + 1) % len(base["init_slices"])
+            gen_idx = base["init_slices"][donor][:a.n]
+        gen = base["pairs"][torch.from_numpy(gen_idx)]
+        assert not (set(gen_idx.tolist()) & set(d["init_idx"][:a.n].tolist())) or a.paired
 
         acc, acc_tr = c2st(syn, gen, device, epochs=a.epochs)
         acc_th, _ = c2st(syn[:, :td], gen[:, :td], device, epochs=a.epochs)
