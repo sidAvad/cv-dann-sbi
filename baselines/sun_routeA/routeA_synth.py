@@ -91,7 +91,7 @@ def cov_trace_ratio(sampled, reference):
 
 
 def synth_one_beta(model, gammas, base, beta, init_idx, theta_dim, x_dim,
-                   initial_step, step_increase, device, log=print):
+                   initial_step, step_increase, device, cmin_x, cmax_x, log=print):
     init = base["pairs"][torch.from_numpy(init_idx)]
     t0 = time.time()
     out, diags = RN.Lgmcmc(gammas=gammas, model=model,
@@ -99,6 +99,7 @@ def synth_one_beta(model, gammas, base, beta, init_idx, theta_dim, x_dim,
                            init_theta_and_x=init,
                            initial_step=initial_step, t_power=float(beta),
                            step_increase=step_increase, device=device,
+                           cmin_x=cmin_x, cmax_x=cmax_x,
                            collect_diagnostics=True)
     dt = time.time() - t0
     out = out.cpu()
@@ -143,6 +144,12 @@ def main():
     # upstream sampler settings
     p.add_argument("--initial-step", type=int, default=10)
     p.add_argument("--step-increase", type=int, default=10)
+    # x step clamp. Upstream ships two different windows: Lgmcmc's signature says
+    # [1e-2, 0.5] and is what its call site uses, while alpha_from_snr_blocks' own
+    # defaults are [2e-5, 1e-4] (identical to theta's). At d_x=809 the former diverges;
+    # see REPRESENTATION.md section 11 for the measured scan behind these values.
+    p.add_argument("--cmin-x", type=float, default=1e-3)
+    p.add_argument("--cmax-x", type=float, default=1e-2)
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--no-assemble", action="store_true",
                    help="write per-beta files only; skip pairs_all.pt")
@@ -174,6 +181,8 @@ def main():
     log(f"betas {betas}")
     log(f"{len(slices[0])} chains/beta, {n_steps} Langevin steps/chain, "
         f"clean x dims {RN.CLEAN_X_DIMS}, device {device}")
+    log(f"x step clamp [{a.cmin_x:g}, {a.cmax_x:g}]*sigma^2 "
+        f"(upstream Lgmcmc call site uses [1e-2, 0.5], which diverges at this d_x)")
 
     wanted = (set(float(b) for b in a.only_beta.split(",")) if a.only_beta
               else set(betas))
@@ -188,7 +197,8 @@ def main():
         if a.smoke:
             _, summary = synth_one_beta(model, gammas, base, beta, slices[i],
                                         theta_dim, x_dim,
-                                        a.initial_step, a.step_increase, device, log)
+                                        a.initial_step, a.step_increase, device,
+                                        a.cmin_x, a.cmax_x, log)
             summaries[beta_tag(beta)] = summary
             continue
         if f.exists() and not a.overwrite:
@@ -198,7 +208,8 @@ def main():
             continue
         rows, summary = synth_one_beta(model, gammas, base, beta, slices[i],
                                        theta_dim, x_dim,
-                                       a.initial_step, a.step_increase, device, log)
+                                       a.initial_step, a.step_increase, device,
+                                       a.cmin_x, a.cmax_x, log)
         tmp = f.with_suffix(".pt.tmp")
         torch.save({"rows": rows, "beta": float(beta),
                     "init_idx": slices[i], "summary": summary}, tmp)
@@ -214,6 +225,8 @@ def main():
             "betas": betas, "n_per_beta": int(len(slices[0])),
             "langevin_steps_per_chain": n_steps,
             "initial_step": a.initial_step, "step_increase": a.step_increase,
+            "cmin_x": a.cmin_x, "cmax_x": a.cmax_x,
+            "cmin_theta": 2e-5, "cmax_theta": 1e-4,
             "clean_x_dims": list(RN.CLEAN_X_DIMS),
             "theta_coords": "unit_cube",
             "per_beta": summaries}

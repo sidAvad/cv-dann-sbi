@@ -388,3 +388,56 @@ R^2_theta decays from 0.48 at sigma=1 to ~0.00 at sigma=0.01, which is the sigma
 section 9 attributed to uniform sigma weighting. Both effects are real; capacity dominates and
 was hiding the other. No sigma-weighting change is made here, since it would be a change to
 their method rather than to the port.
+
+## 11. Upstream's x step clamp diverges at d_x=809; theta is inert at every clamp
+
+With the section-10 width fix the score net reaches val 0.7829 (early-stopped at epoch 1032),
+x norm ratio 0.47 and R^2_x 0.222 -- roughly a 2x improvement on both over 128 wide. Synthesis
+at upstream's call-site clamp nevertheless **diverged harder, not less**: x covariance-trace
+ratio 9.9e23 at beta=1, against 4.6e11 for the 128-wide net. The mechanism is not a
+contradiction. The 128-wide net output approximately zero, so its chain merely random-walked;
+the 1024-wide net has a far larger Lipschitz constant off-distribution, so once a step pushes
+x off the data manifold its score is both large and arbitrary. Capacity cannot fix a step-size
+problem.
+
+Measured scan, 2000 chains, this score net, cmin_x = min(1e-2, cmax_x/10):
+
+| cmax_x | beta | covratio_x | covratio_theta | mean abs dx | mean abs dtheta |
+|---|---|---|---|---|---|
+| 5e-1 | 0.5 | 2.48e11 | 1.9e6 | 2.2e4 | 9.74880 |
+| 5e-1 | 1.0 | 9.86e23 | 5.80e18 | 1.68e10 | 6.58e6 |
+| 1e-1 | 0.5 | 4.612 | 1.059 | 1.5284 | 0.05582 |
+| 1e-1 | 1.0 | 4.628 | 1.053 | 1.5484 | 0.05549 |
+| 1e-2 | 0.5 | 1.422 | 1.055 | 0.5226 | 0.05593 |
+| 1e-2 | 1.0 | 1.374 | 1.056 | 0.4916 | 0.05520 |
+| 1e-3 | 1.0 | 1.044 | 1.062 | 0.1686 | 0.05532 |
+| 1e-4 | 1.0 | 1.005 | 1.059 | 0.0549 | 0.05570 |
+
+**Which clamp is "theirs" is genuinely ambiguous in their code.** `alpha_from_snr_blocks`
+ships `cmin_x=2e-5, cmax_x=1e-4` -- identical to theta's, and stable here --
+while `Lgmcmc`'s signature overrides them to `1e-2, 0.5`, and the `RouteA_generate_pairs`
+call site passes nothing, so the diverging pair is what actually runs. The headline run uses
+`[1e-3, 1e-2]`: the largest window that keeps x's covariance within ~40% of the joint the
+chains start from, so beta has the best available chance to show an effect.
+
+Note that even `cmax_x = 1e-1`, which is about what the SNR formula itself wants with an
+accurate score (`0.125*sigma^2` at beta=1), inflates x by 4.6x. A score at 47% of true
+magnitude supplies 47% of the restoring drift against full-strength injected noise, so the
+stationary spread is wider than p_sigma by roughly that factor at each level, and the later
+levels' smaller steps cannot contract it back. Keeping x at the right scale requires a step
+far below what the formula asks for, at which point x barely moves. There is no window in
+which this sampler both moves x materially and holds the correct scale at this d_x.
+
+**The substantive result, and it does not depend on any of the above:** `covratio_theta` is
+1.05-1.06 and `mean abs dtheta` is 0.0555 at *every* clamp and *every* beta, identical to
+three decimals, excluding only the diverged rows. Beta does nothing to theta. This reproduces
+section 8's analytic-toy finding on real data, now independent of both score quality and step
+size, and it is the finding that matters for the comparison: Route A's sampler does not temper
+theta, so the conditional MDN trained on these pairs has no beta-dependence in theta to learn.
+
+A second observation worth recording, visible in the section-10 numbers: the 1024-wide net has
+**lower** R^2_theta (0.087 at sigma=1) than the 512-wide net (0.483), despite much better
+aggregate loss. Upstream's DSM loss is an unweighted mean over the joint [theta | x], so with
+d_x=809 against d_theta=24, x carries 97% of it. Given more capacity the optimizer spends it
+where the loss is, and theta's score -- the only part inference needs -- is traded away. This
+is a dimension-ratio artifact of the unweighted joint loss, not of the width.
