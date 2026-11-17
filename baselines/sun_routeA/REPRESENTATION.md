@@ -289,3 +289,44 @@ Caveat: the toy is 2+5 dimensional. `alpha_from_snr_blocks` scales the unclamped
 `theta_dim`, so our 24-dim theta gets a 12x larger unclamped step -- but 80% of steps were
 already at the clamp *ceiling*, and a larger unclamped value pushes further past it, so expect
 more clamping in the real setting, not less. Verify rather than assume.
+
+## 9. Phase-2 gate outcome: FAILED as specified, diagnosed as upstream's loss weighting
+
+`verify_phase2.py` checks A/B require relative L2 score error < 0.10 at **every** sigma.
+Measured worst case: **0.1010** (unmasked) and **0.1105** (masked). The gate failed on the
+criterion set before the run; the threshold was deliberately not relaxed afterwards.
+
+Budget scaling (`--epochs 150 / 600 / 1500`, unmasked, theta block):
+
+| sigma | 150 ep | 600 ep | 1500 ep |
+|---|---|---|---|
+| 0.01 | 0.1459 | 0.1077 | **0.1010** |
+| 0.0167 | 0.1413 | 0.0936 | 0.0964 |
+| 0.3594 | 0.1304 | 0.0569 | 0.0691 |
+| 1.00 | 0.0925 | 0.0262 | **0.0186** |
+
+Large sigma converges at roughly 1/sqrt(steps); small sigma flattens onto a floor near 0.10
+(2.5x more epochs bought 6%). The masked variant was at its floor from 150 epochs
+(0.1102 / 0.1087 / 0.1105 at sigma=0.01).
+
+**Diagnosis.** `score_matching_loss` samples `t_idx` uniformly and weights every noise level
+equally in the MSE, while the fittable signal at level sigma is O(sigma). The gradient signal
+for small sigma is therefore ~sigma^2 weaker, so the optimiser allocates capacity to mid and
+large sigma and lets the small-sigma score drift. This predicts all three observations: flat
+in budget at small sigma, converging at large sigma, and the same floor masked or not. It is a
+property of upstream's unweighted DSM -- sigma-weighted (likelihood-weighted) DSM is the
+standard remedy and upstream does not use it. More epochs or data will not move it.
+
+**Independent evidence the port is correct**, which is what the gate existed to establish:
+large-sigma error reaches 1.9% and converges at the right rate; the clean dim's learned score
+is 0.0000 against an analytic 0.8058, exactly as section 4's derivation predicts; the sampler
+reproduces the beta=1 joint to 0.5%; and the error is smooth and monotone in sigma, which a
+wiring fault would not produce.
+
+**Practical weight:** low. The sampler's steps at sigma=0.01 are clamped to ~1e-8, so the
+small-sigma score barely influences the trajectory -- the same clamping that causes the far
+more serious section-8 problem. A sigma-weighted gate would be the better criterion for any
+future rerun; it is not retrofitted here.
+
+Open if certainty is wanted: a capacity/data sweep at fixed epochs (hidden_dim 128 -> 512, or
+n 200k -> 800k). A floor that stays at 0.10 confirms the diagnosis as structural.
