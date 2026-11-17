@@ -441,3 +441,46 @@ aggregate loss. Upstream's DSM loss is an unweighted mean over the joint [theta 
 d_x=809 against d_theta=24, x carries 97% of it. Given more capacity the optimizer spends it
 where the loss is, and theta's score -- the only part inference needs -- is traded away. This
 is a dimension-ratio artifact of the unweighted joint loss, not of the width.
+
+## 12. Theta is beta-inert at every clamp, because its trajectory is pure diffusion
+
+Section 11 established that theta is beta-inert at upstream's clamp. The obvious objection is
+that this is an artifact of the clamp rather than of the method, so the clamp was scanned over
+four orders of magnitude, 2000 chains per cell, x clamp held at the section-11 value:
+
+| cmax_theta | covratio_theta, beta=0.5 / 1.0 / 1.5 | pure-diffusion prediction |
+|---|---|---|
+| 1e-4 (upstream) | 1.058 / 1.055 / 1.058 | 1.055 |
+| 1e-3 | 1.563 / 1.568 / 1.579 | 1.552 |
+| 1e-2 | 6.739 / 6.595 / 6.507 | 6.52 |
+| 3e-2 | 17.62 / 17.64 / 17.27 | 17.6 |
+| 1e-1 | 56.66 / 55.87 / 55.33 | 56.2 |
+| 5e-1 | 308 / 309 / 323 | 277 |
+
+The prediction is the variance a driftless random walk would add, divided by the prior's:
+`1 + 2*cmax_theta*sum_t(sigma_t^2 * steps_t) / Var(prior)` = `1 + 552*cmax_theta` for this
+schedule and the unit cube. It matches measurement to within a few percent at every step size.
+Theta's trajectory is therefore **diffusion with no effective drift**.
+
+This is what makes the beta-inertness structural rather than a tuning artifact. Beta enters the
+update only through the drift term (`t_power * a * score`); if the drift is numerically
+irrelevant next to the diffusion, beta cannot act, at any step size. Tightening the clamp makes
+the diffusion negligible -- upstream's setting, where theta simply stays at its prior draw and
+the marginal is preserved by accident. Loosening it makes the diffusion destructive (100% of
+theta outside the unit cube at cmax_theta=0.5). No value in between hands control to the drift.
+
+**Why a relaxed-theta arm was not run.** It was proposed, and this scan is what it would have
+tested. The result is conclusive at 2000 chains per cell, so the full arm would only have
+produced 980k rows of random-walked theta and an MDN trained on them. The relaxation remains
+exposed as `--cmin-theta/--cmax-theta` for anyone who wants to reproduce the scan.
+
+**Root cause, one level down.** Theta's score is not learned: R^2_theta is 0.087 at sigma=1 and
+0.0007 at sigma=0.01 (section 11). Upstream's `score_matching_loss` is an unweighted mean over
+the concatenated `[theta | x]` residual, so with d_x=809 against d_theta=24, x carries 97% of
+the loss. Capacity and gradient signal go where the loss is; theta's score never develops; the
+sampler's theta block degenerates to diffusion. The two failures in sections 11 and 12 are the
+same cause seen from two sides.
+
+Both plausible remedies -- weighting the two blocks by dimension, or sigma-weighted DSM -- are
+changes to their loss, not to the port, and are not made here. Recording them as the identified
+fix is the useful output.
