@@ -218,3 +218,74 @@ set. At matched sims that is a regularisation difference, not a data-volume one.
 - `train()` in `RouteA_utils.py:87` accumulates `loss_k / B` although `F.mse_loss` already
   averages, so the reported loss scales with batch size. Harmless to the gradient, but
   the logged number is not comparable across batch sizes.
+
+---
+
+## 8. Phase-2 result: the sampler does not temper theta (measured, analytic toy)
+
+Run `verify_phase2.py`. Checks C/D feed the **exact analytic score** of a linear-Gaussian
+joint to upstream's `Lgmcmc`, so any failure is the sampler's, not a score-network error.
+
+| beta | cov ratio theta | cov ratio x | mean \|dtheta\| | mean \|dx\| | clamp-bound theta/x |
+|---|---|---|---|---|---|
+| 0.5 | 0.497 | 0.819 | 0.0875 | 4.83 | 0.80 / 1.00 |
+| 1.0 | 0.993 | 0.997 | 0.0871 | 4.02 | 0.80 / 0.91 |
+| 2.0 | 1.981 | 1.382 | 0.0876 | 3.46 | 0.80 / 0.80 |
+
+Ratio 1.0 = correct (target covariance is `S/beta`). At beta=0.5 the target is `2S` and the
+ratio 0.497 means the empirical covariance is `0.99 S`; at beta=2 the target is `S/2` and
+1.981 again means `0.99 S`. **theta's covariance is the untempered one at every beta**, and
+`mean |dtheta|` is beta-independent to three digits (0.0875 / 0.0871 / 0.0876). Cause is the
+last column: 80% of theta steps are pinned at the `[2e-5 sigma^2, 1e-4 sigma^2]` clamp, which
+erases the `1/beta^2` term in `alpha_from_snr_blocks` and leaves a drift too small to move
+anything. x does respond but undershoots (64% of the required spread at beta=0.5, 69% of the
+required shrinkage at beta=2). beta=1 is correct to 0.3-0.7%, which validates our wiring.
+Reproduced identically at 150 and 600 score-net epochs, as expected for an analytic-score check.
+
+### Why a frozen theta is a defect, correcting section 2
+
+Section 2 reports the tilted theta-**marginal** as Route A's asymmetry versus Gibbs. That is
+the wrong object to worry about: an NPE learns the **conditional**, so a tilted marginal only
+costs training coverage, not correctness. The real problem is the opposite one.
+
+With theta pinned, x is drawn from the tempered likelihood *renormalised for that theta*,
+`p(x|theta)^beta / Z_beta(theta)`. The realised pair joint is then
+`pi(theta) p(x|theta)^beta / Z_beta(theta)`, whose conditional is
+
+```
+q(theta|x)  ∝  pi(theta) p(x|theta)^beta / Z_beta(theta)
+            =  [power posterior] x |Sigma(theta)|^((beta-1)/2)
+```
+
+since `Z_beta(theta) ∝ |Sigma(theta)|^((1-beta)/2)` for a Gaussian likelihood. Dividing by
+`Z_beta(theta)` discards exactly the quantity that tempering is supposed to use to reweight
+theta. Concretely: with `x|A ~ N(0,1)` and `x|B ~ N(0,0.1^2)`, observing x=0 gives a beta=1
+odds ratio of 10 and a correct beta=0.5 ratio of 3.16, but the frozen-theta construction
+returns **10** -- the untempered answer. That is the same thing the table measures.
+
+For Route A `Sigma(theta) ~ sigma^2 (I + J J^T)` with J the simulator Jacobian, so the tilt is
+`|I + J^T J|^((beta-1)/2)` (Weinstein-Aronszajn turns the 808x808 determinant into a 24x24
+one). It vanishes only at beta=1, and for beta<1 the exponent is negative, so it
+**under-weights the theta where the simulator is most sensitive** -- exactly where the
+posterior is normally most informative.
+
+Practical consequence: **Route A's beta knob is largely inert for theta at this scale**, so the
+NPE's amortisation over beta has little to learn and post-hoc recalibration through beta
+would not work. That is worse than a bias and it sits upstream of phases 4-6.
+
+**Gibbs NPE is structurally immune, for a reason worth stating:** its noise covariance is
+`M/w` with M frozen and theta-independent, so `Z_w` is constant, no tilt arises, and the pair
+conditional *is* the Gibbs posterior by construction. The vulnerability is specific to
+Route A's covariance inheriting the simulator's local geometry.
+
+### Cheapest confirmation in the real setting
+
+After synthesis, check whether the pair sets at different beta actually differ in theta|x --
+e.g. theta spread at fixed x, per beta. If it is flat across beta, the knob is confirmed inert
+here and not just in the toy. That is far cheaper than the FD Jacobian, which is then only
+needed to quantify the tilt's magnitude (the spread of `log|I + J^T J|` across the prior).
+
+Caveat: the toy is 2+5 dimensional. `alpha_from_snr_blocks` scales the unclamped step with
+`theta_dim`, so our 24-dim theta gets a 12x larger unclamped step -- but 80% of steps were
+already at the clamp *ceiling*, and a larger unclamped value pushes further past it, so expect
+more clamping in the real setting, not less. Verify rather than assume.
