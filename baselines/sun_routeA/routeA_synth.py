@@ -91,7 +91,8 @@ def cov_trace_ratio(sampled, reference):
 
 
 def synth_one_beta(model, gammas, base, beta, init_idx, theta_dim, x_dim,
-                   initial_step, step_increase, device, cmin_x, cmax_x, log=print):
+                   initial_step, step_increase, device, cmin_x, cmax_x,
+                   cmin_theta, cmax_theta, log=print):
     init = base["pairs"][torch.from_numpy(init_idx)]
     t0 = time.time()
     out, diags = RN.Lgmcmc(gammas=gammas, model=model,
@@ -100,6 +101,7 @@ def synth_one_beta(model, gammas, base, beta, init_idx, theta_dim, x_dim,
                            initial_step=initial_step, t_power=float(beta),
                            step_increase=step_increase, device=device,
                            cmin_x=cmin_x, cmax_x=cmax_x,
+                           cmin_theta=cmin_theta, cmax_theta=cmax_theta,
                            collect_diagnostics=True)
     dt = time.time() - t0
     out = out.cpu()
@@ -150,6 +152,13 @@ def main():
     # see REPRESENTATION.md section 11 for the measured scan behind these values.
     p.add_argument("--cmin-x", type=float, default=1e-3)
     p.add_argument("--cmax-x", type=float, default=1e-2)
+    # theta step clamp. Upstream's [2e-5, 1e-4] binds for ANY score in ANY dimension: with
+    # an accurate score their own SNR rule returns 0.125*sigma^2/beta^2 (d_theta cancels),
+    # which is 1250x above cmax_theta at beta=1. So beta never reaches theta's step. These
+    # defaults are upstream's; raise cmax-theta to let their rule drive theta instead of
+    # their guard rail. See REPRESENTATION.md section 12.
+    p.add_argument("--cmin-theta", type=float, default=2e-5)
+    p.add_argument("--cmax-theta", type=float, default=1e-4)
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--no-assemble", action="store_true",
                    help="write per-beta files only; skip pairs_all.pt")
@@ -183,6 +192,8 @@ def main():
         f"clean x dims {RN.CLEAN_X_DIMS}, device {device}")
     log(f"x step clamp [{a.cmin_x:g}, {a.cmax_x:g}]*sigma^2 "
         f"(upstream Lgmcmc call site uses [1e-2, 0.5], which diverges at this d_x)")
+    log(f"theta step clamp [{a.cmin_theta:g}, {a.cmax_theta:g}]*sigma^2 "
+        f"(upstream [2e-5, 1e-4]; their SNR rule asks for 0.125/beta^2)")
 
     wanted = (set(float(b) for b in a.only_beta.split(",")) if a.only_beta
               else set(betas))
@@ -198,7 +209,8 @@ def main():
             _, summary = synth_one_beta(model, gammas, base, beta, slices[i],
                                         theta_dim, x_dim,
                                         a.initial_step, a.step_increase, device,
-                                        a.cmin_x, a.cmax_x, log)
+                                        a.cmin_x, a.cmax_x,
+                                        a.cmin_theta, a.cmax_theta, log)
             summaries[beta_tag(beta)] = summary
             continue
         if f.exists() and not a.overwrite:
@@ -209,7 +221,8 @@ def main():
         rows, summary = synth_one_beta(model, gammas, base, beta, slices[i],
                                        theta_dim, x_dim,
                                        a.initial_step, a.step_increase, device,
-                                       a.cmin_x, a.cmax_x, log)
+                                       a.cmin_x, a.cmax_x,
+                                       a.cmin_theta, a.cmax_theta, log)
         tmp = f.with_suffix(".pt.tmp")
         torch.save({"rows": rows, "beta": float(beta),
                     "init_idx": slices[i], "summary": summary}, tmp)
@@ -226,7 +239,7 @@ def main():
             "langevin_steps_per_chain": n_steps,
             "initial_step": a.initial_step, "step_increase": a.step_increase,
             "cmin_x": a.cmin_x, "cmax_x": a.cmax_x,
-            "cmin_theta": 2e-5, "cmax_theta": 1e-4,
+            "cmin_theta": a.cmin_theta, "cmax_theta": a.cmax_theta,
             "clean_x_dims": list(RN.CLEAN_X_DIMS),
             "theta_coords": "unit_cube",
             "per_beta": summaries}
