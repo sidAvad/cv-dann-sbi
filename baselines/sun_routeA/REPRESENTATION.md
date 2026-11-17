@@ -330,3 +330,61 @@ future rerun; it is not retrofitted here.
 
 Open if certainty is wanted: a capacity/data sweep at fixed epochs (hidden_dim 128 -> 512, or
 n 200k -> 800k). A floor that stays at 0.10 confirms the diagnosis as structural.
+
+## 10. The one port change: network width must scale with d_x (and it is not optional)
+
+Trained at upstream's own `emb_dim = hidden_dim = 128`, the score net converged to val
+0.9521 after 789 epochs (early-stopped by upstream's own rule). Measured on held-out pairs
+in the regime it was trained on, that net explains **4.7% of the noise variance on x and 4.0%
+on theta, flat across every sigma**, with an output norm 21% of the target's -- MSE shrinkage
+toward zero. The baseline for predicting identically zero is 0.9988, so 789 epochs bought 3.4
+percentage points.
+
+Flatness in sigma is the diagnostic. At sigma=0.01 the noised x sits essentially on the data
+manifold and eps is highly predictable, so a working net's R^2 must rise sharply as sigma
+falls. It did not move at all, which is a representational ceiling rather than an
+optimization one: `ScoreNet_sigma` embeds x through `ResidualMLP(809 -> 128)` and must emit an
+809-dim score field from a 384-dim concatenated bottleneck.
+
+**Why this is a port artifact and not a property of their method.** Upstream's `d_x` is ~10,
+so 128 sits an order of magnitude *above* their input dimension and the embedding is nowhere
+near binding. At `d_x = 809` the same constant sits far *below* it. Scaling width to exceed
+d_x restores the relationship their setting had; it changes no part of the method. Measured at
+matched epochs, same 8 s/epoch and 4-9 GB of a 32 GB card at every width:
+
+| emb=hidden | val @20 | @40 | @60 | best ever |
+|---|---|---|---|---|
+| 128 (upstream) | 0.9712 | 0.9684 | 0.9645 | 0.9521 (789 ep) |
+| 512 | 0.9080 | 0.8910 | 0.8813 | -- |
+| 1024 | 0.9625 | 0.8335 | 0.8200 | -- |
+
+1024 passes the 128-wide net's 789-epoch converged best by about epoch 25. Width was free in
+both time and memory, so the 128-wide result was not a compute/quality tradeoff -- it was
+simply too small a model.
+
+**Consequence for the sampler, which is why this blocked phase 4b.** Upstream's step rule
+`a_x = 0.5*d_x*tau^2/(g^2*beta^2)` clamped to `[1e-2*sigma^2, 0.5*sigma^2]` is self-calibrating
+*provided the score has roughly the right magnitude*: with `g_x^2 = d_x/sigma^2` it returns
+`0.125*sigma^2/beta^2`, comfortably inside the clamp. At a norm ratio of 0.215 the 128-wide
+net's `g^2` is ~20x too small, the formula overshoots by ~1200x, and `a_x` pins to
+`cmax_x = 0.5*sigma^2` on every step -- full-strength injected noise against a restoring drift
+only a fifth as strong as it should be, compounding over the 10 levels. Synthesis blew up
+accordingly, including at beta=1 where the chain starts at the simulator's own joint and must
+reproduce it: covariance-trace ratio 4.6e11 on x, 4.5e5 on theta. The arm fails its own
+control before any beta comparison is possible. The clamp values are upstream's
+(`vendor/RouteA_utils.py:195`; `RouteA_generate_pairs.py` overrides nothing), so no clamp
+retuning is warranted -- the clamp only binds because the score is too small.
+
+The criterion for synthesis stability is therefore a property of the trained net, checkable in
+minutes before committing hours to sampling: **the x-block norm ratio `|s_hat|/|eps|` must
+reach ~0.5** (R^2_x ~ 0.25) for `a_x` to fall inside the clamp unaided.
+
+**Correction to section 9.** That section closed by proposing a capacity/data sweep and
+predicting a floor that "stays at 0.10", i.e. that the DSM error was structural in upstream's
+unweighted loss and that "more epochs or data will not move it". Run, the sweep refutes the
+strong form of that claim: width moved the real-data net from 4.7% to 48% explained variance
+on theta. The weaker form survives and is now visible rather than masked -- at 1024 wide,
+R^2_theta decays from 0.48 at sigma=1 to ~0.00 at sigma=0.01, which is the sigma profile
+section 9 attributed to uniform sigma weighting. Both effects are real; capacity dominates and
+was hiding the other. No sigma-weighting change is made here, since it would be a change to
+their method rather than to the port.
