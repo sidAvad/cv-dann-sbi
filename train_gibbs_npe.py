@@ -194,9 +194,14 @@ def estimate_metric(sim_x, obs, cal_x, log=print, lam_thresh=1e-4):
     return metric, float(w_hat), info
 
 
-def check_noise_consistency(sim_x, obs, metric, w_test, n_draws=256, tol=0.05, log=print):
-    """Pre-launch unit check: noise from noisy_obs must have ||phi(noise)||^2 ~ d_eff / w."""
-    m_t, o_t = metric_to_torch(metric, obs, "cpu")
+def check_noise_consistency(sim_x, obs, metric, w_test, n_draws=256, tol=0.05, log=print,
+                            correction=None):
+    """Pre-launch unit check: noisy_obs must reproduce the model's own second moment.
+
+    E||delta phi||^2 = ||mu_r||^2 + tr(Sigma_c)/w, which reduces to d_eff/w when there
+    is no correction.
+    """
+    m_t, o_t = metric_to_torch(metric, obs, "cpu", correction)
     x0 = torch.from_numpy(sim_x[:n_draws])
     torch.manual_seed(0)
     lw = torch.full((n_draws, 1), float(np.log(w_test)))
@@ -204,25 +209,51 @@ def check_noise_consistency(sim_x, obs, metric, w_test, n_draws=256, tol=0.05, l
     delta = phi_from_z(x_noisy, obs, metric) - phi_from_z(sim_x[:n_draws], obs, metric)
     measured = (delta ** 2).sum(1).mean()
     expected = metric.d_eff / w_test
+    if correction is not None:
+        expected = (float((correction["mu_r"] ** 2).sum())
+                    + (metric.d_eff + float(correction["a"].sum())) / w_test)
     rel = abs(measured - expected) / expected
     log(f"  noise check at w={w_test:.4g}: mean ||delta phi||^2 = {measured:.4g}, "
-        f"expected d_eff/w = {expected:.4g}, rel err {rel:.3f}")
+        f"expected = {expected:.4g}, rel err {rel:.3f}")
     if rel > tol:
         raise RuntimeError(f"noise/metric mismatch: rel err {rel:.3f} > {tol}")
 
 
 def noisy_obs(x, log_w, metric_t, obs_t):
-    """Apply w^{-1/2}-scaled metric-consistent noise to a batch in z-space. Fresh noise per call."""
+    """Apply metric-consistent noise to a batch in z-space. Fresh noise per call.
+
+    The draw is made in phi coordinates, where the metric says the noise is white: the
+    per-wave block holds k_t Matern-mode coefficients and the tail holds the 4 scalars,
+    in the same order phi_from_z concatenates them. Scaling by s_wave/s_scal and the
+    Bn projection then carry it back to z-space, with the 4th scalar multiplicative
+    because phi takes its log.
+
+    With a correction present the draw is eps ~ N(mu_r, Sigma_c / w),
+    Sigma_c = I + U diag(a) U^T. mu_r is NOT scaled by w^{-1/2}: it is a fixed
+    displacement, so the loss (x - f(theta) - mu_r)^T Sigma_c^-1 (...) stays a fixed
+    quadratic that w tempers, keeping the Gibbs correspondence and w-amortization exact.
+    """
     B = x.shape[0]
+    k = metric_t["k"]
     inv_sqrt_w = torch.exp(-0.5 * log_w)
+    eps = torch.randn(B, NW * k + 4, device=x.device)
+    U, a = metric_t.get("cor_U"), metric_t.get("cor_a")
+    if U is not None:
+        # Sigma_c^{1/2} eps = eps + U (sqrt(1+a) - 1) U^T eps
+        eps = eps + (eps @ U) * (torch.sqrt(1.0 + a) - 1.0) @ U.T
+    eps = eps * inv_sqrt_w
+    mu = metric_t.get("cor_mu")
+    if mu is not None:
+        eps = eps + mu
+    z = eps[:, :NW * k].reshape(B, NW, k)
+    e = eps[:, NW * k:]
+
     waves = x[:, :WAVE_LEN].reshape(B, NW, T)
-    z = torch.randn(B, NW, metric_t["k"], device=x.device)
     noise = z @ metric_t["Bn"]
-    waves = waves + noise * (metric_t["s_wave"] / obs_t["wave_std"])[None, :, None] * inv_sqrt_w[:, :, None]
+    waves = waves + noise * (metric_t["s_wave"] / obs_t["wave_std"])[None, :, None]
     sc = x[:, WAVE_LEN:].clone()
-    e = torch.randn(B, 4, device=x.device)
-    sc[:, :3] = sc[:, :3] + e[:, :3] * (metric_t["s_scal"][:3] / obs_t["pas_std"]) * inv_sqrt_w
-    sc[:, 3:4] = sc[:, 3:4] * torch.exp(e[:, 3:4] * metric_t["s_scal"][3] * inv_sqrt_w)
+    sc[:, :3] = sc[:, :3] + e[:, :3] * (metric_t["s_scal"][:3] / obs_t["pas_std"])
+    sc[:, 3:4] = sc[:, 3:4] * torch.exp(e[:, 3:4] * metric_t["s_scal"][3])
     return torch.cat([waves.reshape(B, WAVE_LEN), sc], 1)
 
 
@@ -241,7 +272,7 @@ def load_sim_tensors(data_dir, index_entries, stats, log):
     return theta, x
 
 
-def metric_to_torch(metric, obs, device):
+def metric_to_torch(metric, obs, device, correction=None):
     m = {"k": metric.k, "Bn": torch.from_numpy(metric.Bn).to(device),
          "Q": torch.from_numpy(metric.Q).to(device),
          "s_wave": torch.from_numpy(metric.s_wave).to(device),
@@ -250,6 +281,10 @@ def metric_to_torch(metric, obs, device):
          "wave_mean": torch.from_numpy(obs.wave_mean).to(device),
          "pas_std": float(obs.pas_std), "pas_mean": float(obs.pas_mean),
          "vlv_std": float(obs.vlv_std)}
+    if correction is not None:
+        m["cor_U"] = torch.from_numpy(correction["U"].astype(np.float32)).to(device)
+        m["cor_a"] = torch.from_numpy(correction["a"].astype(np.float32)).to(device)
+        m["cor_mu"] = torch.from_numpy(correction["mu_r"].astype(np.float32)).to(device)
     return m, o
 
 
@@ -349,6 +384,11 @@ def main():
     parser.add_argument("--w-hi", type=float, default=None,
                         help="Upper end of the log-uniform w training range, in absolute "
                              "units. Must be given with --w-lo. Default: 10*w_hat.")
+    parser.add_argument("--correction", default=None,
+                        help="npz with mu_r, U, a: the low-rank enrichment of the noise "
+                             "covariance, Sigma_c = I + U diag(a) U^T, plus a mean "
+                             "offset. Fitted off-line from theta-paired residuals; see "
+                             "experiments.md. Omitted, the noise stays N(0, I/w) in phi.")
     parser.add_argument("--n-val-sims", type=int, default=4096,
                         help="Held-out sims for the validation NLL, taken from the "
                              "manifest entries AFTER the --n-sims training slice, so "
@@ -429,6 +469,16 @@ def main():
     cal_x = real_x_t.numpy()[cal_idx]
     log(f"Real patients: {len(cal_idx)} calibration / {len(test_idx)} test")
 
+    correction = None
+    if args.correction:
+        correction = dict(np.load(args.correction))
+        log(f"Noise correction from {args.correction}: rank {int(correction['rank'])}, "
+            f"projected={bool(correction['projected'])}, "
+            f"||mu_r||^2={float((correction['mu_r']**2).sum()):.4g}, "
+            f"a in [{float(correction['a'].min()):.3g}, "
+            f"{float(correction['a'].max()):.3g}], "
+            f"self-consistent w={float(correction['w']):.4g}")
+
     start_epoch = 1
     if args.resume_dir:
         src = Path(args.resume_dir)
@@ -449,7 +499,7 @@ def main():
         log("Stage 1-2: estimating metric M and w_hat on calibration patients...")
         metric, w_hat, cal_info = estimate_metric(sim_x, obs, cal_x, log=log)
         log(f"  w_hat = {w_hat:.6g}   training range [{w_hat/10:.4g}, {10*w_hat:.4g}]")
-        check_noise_consistency(sim_x, obs, metric, w_hat, log=log)
+        check_noise_consistency(sim_x, obs, metric, w_hat, log=log, correction=correction)
 
     if (args.w_lo is None) != (args.w_hi is None):
         raise SystemExit("--w-lo and --w-hi must be given together")
@@ -474,6 +524,14 @@ def main():
         gibbs_meta["test_patients"] = [real_files[i] for i in test_idx]
     np.savez(ckpt_dir / "gibbs_metric.npz", V=metric.V, eigvals=metric.lam,
              s_wave=metric.s_wave, s_scal=metric.s_scal)
+    if correction is not None:
+        gibbs_meta["correction"] = {
+            "path": args.correction, "rank": int(correction["rank"]),
+            "projected": bool(correction["projected"]),
+            "w_self_consistent": float(correction["w"]),
+            "mu_r_sq": float((correction["mu_r"] ** 2).sum()),
+            "a_sum": float(correction["a"].sum())}
+        np.savez(ckpt_dir / "gibbs_correction.npz", **correction)
 
     with open(ckpt_dir / "gibbs_metric.json", "w") as f:
         json.dump(gibbs_meta, f, indent=2)
@@ -535,7 +593,7 @@ def main():
 
     sim_dl = DataLoader(TensorDataset(sim_theta, sim_x_t), batch_size=args.batch_size, shuffle=True,
                         num_workers=0, pin_memory=True, drop_last=True)
-    m_t, o_t = metric_to_torch(metric, obs, device)
+    m_t, o_t = metric_to_torch(metric, obs, device, correction)
 
     # One fixed (log w, noise) realisation, drawn in a forked RNG so the training stream
     # is untouched. log w uses the same U[log(w_hat/10), log(10 w_hat)] prior the training
