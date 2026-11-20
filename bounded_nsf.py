@@ -26,7 +26,7 @@ from nflows.transforms import (
     RandomPermutation,
 )
 from nflows.transforms import splines as _splines
-from nflows.transforms.base import Transform
+from nflows.transforms.base import InputOutsideDomain, Transform
 
 # Keeps u strictly inside the spline's domain; the spline raises on inputs outside
 # [0, 1] and (theta - lo) / span can land a few ulp past an endpoint.
@@ -36,8 +36,13 @@ _EPS = 1e-6
 # clamped away rather than raised on. Anything larger still raises.
 _DOMAIN_TOL = 1e-4
 
-# Number of clamped round-off violations since import, for diagnostics.
+# Number of clamped round-off violations and batch redraws since import, for
+# diagnostics.
 domain_clamps = 0
+sample_retries = 0
+
+# Redraws allowed before a sampling failure is treated as real and re-raised.
+_SAMPLE_RETRIES = 8
 
 _orig_rq_spline = _splines.rational_quadratic_spline
 
@@ -146,7 +151,26 @@ class BoundedNSF(nn.Module):
         n = (int(sample_shape[0]) if isinstance(sample_shape, (tuple, list, torch.Size))
              else int(sample_shape))
         # nflows gives (n_context, n, dim); sbi's callers expect (n, n_context, dim)
-        return self._flow.sample(n, context=condition).transpose(0, 1)
+        return self._retry_sample(n, condition).transpose(0, 1)
+
+    def _retry_sample(self, n, condition):
+        """Draw n samples per context, redrawing the batch on a round-off failure.
+
+        The inverse spline solve is exact in real arithmetic but has two float32
+        failure points: an input landing a few ulp outside the domain (handled by
+        _rq_spline_clamped) and a discriminant going slightly negative at a knot,
+        which nflows asserts on. Either aborts the whole batch, since the checks are
+        batch-wide. The base draw is i.i.d. uniform, so redrawing almost surely
+        avoids the offending point; the sample is still exact, just reseeded.
+        """
+        global sample_retries
+        for attempt in range(_SAMPLE_RETRIES):
+            try:
+                return self._flow.sample(n, context=condition)
+            except (InputOutsideDomain, AssertionError):
+                sample_retries += 1
+                if attempt == _SAMPLE_RETRIES - 1:
+                    raise
 
 
 def build_bounded_nsf(context_features, lo, hi, log_dims, num_bins=10,
