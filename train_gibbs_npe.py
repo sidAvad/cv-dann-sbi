@@ -881,7 +881,7 @@ def main():
         info = json.load(f)
     info.update({"status": "complete", "w_hat": w_hat, "d_eff": metric.d_eff,
                  "last_epoch": last_epoch, "n_sims": len(sim_theta), "checkpoint": ts,
-                 "n_val_sims": (0 if val_pack is None else int(val_pack[0].shape[0])),
+                 "n_val_sims": (0 if val_pack is None else int(val_pack[0][0].shape[0])),
                  "val_seed": args.val_seed})
     with open(run_info_path, "w") as f:
         json.dump(info, f, indent=2)
