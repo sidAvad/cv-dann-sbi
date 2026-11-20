@@ -25,11 +25,55 @@ from nflows.transforms import (
     PiecewiseRationalQuadraticCouplingTransform,
     RandomPermutation,
 )
+from nflows.transforms import splines as _splines
 from nflows.transforms.base import Transform
 
 # Keeps u strictly inside the spline's domain; the spline raises on inputs outside
 # [0, 1] and (theta - lo) / span can land a few ulp past an endpoint.
 _EPS = 1e-6
+
+# Overshoot (in units of the spline's own domain) treated as float32 round-off and
+# clamped away rather than raised on. Anything larger still raises.
+_DOMAIN_TOL = 1e-4
+
+# Number of clamped round-off violations since import, for diagnostics.
+domain_clamps = 0
+
+_orig_rq_spline = _splines.rational_quadratic_spline
+
+
+def _rq_spline_clamped(inputs, *args, inverse=False, left=0.0, right=1.0,
+                       bottom=0.0, top=1.0, **kwargs):
+    """nflows' tails=None spline, with round-off at the domain edge clamped.
+
+    A bounded spline maps its domain onto itself, so a composition of them cannot
+    leave [0, 1]. The inverse direction reaches a point by solving a quadratic,
+    though, and in float32 that solve can land a few ulp outside the interval when
+    the root sits on a bin edge; nflows then raises InputOutsideDomain on the next
+    layer's strict check. Clamping the round-off keeps the draw, which is the same
+    guard BoxToUnit.forward already applies on the log_prob path.
+
+    Only tails=None splines are routed through here, so the unconstrained (linear
+    tails) variant other flows use is untouched.
+    """
+    global domain_clamps
+    lo, hi = (bottom, top) if inverse else (left, right)
+    mn, mx = float(inputs.min()), float(inputs.max())
+    if mn < lo - _DOMAIN_TOL or mx > hi + _DOMAIN_TOL:
+        # Too far out to be round-off; let nflows raise so the real cause surfaces.
+        return _orig_rq_spline(inputs, *args, inverse=inverse, left=left, right=right,
+                               bottom=bottom, top=top, **kwargs)
+    if mn < lo or mx > hi:
+        domain_clamps += 1
+        inputs = inputs.clamp(lo, hi)
+    return _orig_rq_spline(inputs, *args, inverse=inverse, left=left, right=right,
+                           bottom=bottom, top=top, **kwargs)
+
+
+# coupling.py resolves splines.rational_quadratic_spline from the package namespace at
+# call time, so patching the package attribute is what reaches the stacked layers --
+# including those inside flows unpickled from existing checkpoints.
+_splines.rational_quadratic_spline = _rq_spline_clamped
 
 
 class BoxToUnit(Transform):
