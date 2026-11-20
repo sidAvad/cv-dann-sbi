@@ -46,6 +46,7 @@ from dataset import (
 from models import LipschitzReducedAutoencoderEncoder
 from train_joint import build_flow_net, load_real_beats
 from bounded_nsf import build_bounded_nsf
+from mdn_flow import build_mdn, WPassthrough
 
 WAVE_LEN = NW * T
 MATERN_LAGS = 40
@@ -318,6 +319,55 @@ class WEmbed(nn.Module):
         return self.net((log_w - self.center) / self.half_width)
 
 
+def prior_box(nested_sim_root, keys):
+    """(lo, hi, log_mask) of the prior box, in PARAM_KEYS_INFER order."""
+    sys.path.insert(0, nested_sim_root)
+    from nested_sim.params import THETA_BOUNDS, LOG_SAMPLED, to_binary_names
+    bb = to_binary_names(THETA_BOUNDS)
+    lo = np.array([bb[k][0] for k in keys], dtype=np.float64)
+    hi = np.array([bb[k][1] for k in keys], dtype=np.float64)
+    mask = np.zeros(len(keys), dtype=bool)
+    mask[[keys.index(k) for k in to_binary_names({k: 0 for k in LOG_SAMPLED})]] = True
+    return lo, hi, mask
+
+
+def to_unit_unclamped(phys, lo, hi, log_mask):
+    """Prior box -> unit cube, logs on the log-uniform dims, without clamping to [0,1].
+
+    Mirrors eval_pretrained_lofihifi.to_unit_unclamped so the calibration curve is on
+    the same scale as the published scores. Non-positive draws on a log dimension are
+    floored, landing far below 0, where the caller's winsorisation handles them.
+    """
+    x = np.where(log_mask, np.log(np.clip(phys, 1e-30, None)), phys)
+    lo2 = np.where(log_mask, np.log(lo), lo)
+    hi2 = np.where(log_mask, np.log(hi), hi)
+    return (x - lo2) / (hi2 - lo2)
+
+
+def load_calib_theta(path, real_files, cal_idx, keys):
+    """Ground-truth theta for the calibration stand-ins, in real_x_t row order.
+
+    The stand-in files carry only HR/PVR/SVR; scripts/export_hifi_theta.py recovers the
+    full vector from the source target set and keys it by the global index in the file
+    name.
+    """
+    d = np.load(path, allow_pickle=True)
+    pk = [str(k) for k in d["param_keys"]]
+    if pk != list(keys):
+        raise SystemExit(f"{path} is in a different parameter order than "
+                         f"PARAM_KEYS_INFER (first mismatch at "
+                         f"{next(i for i, (a, b) in enumerate(zip(pk, keys)) if a != b)})")
+    tbl = {int(i): r for i, r in zip(d["indices"], d["theta"])}
+    out, missing = [], []
+    for i in cal_idx:
+        gi = int(str(real_files[i]).rsplit("_", 1)[1])
+        (out.append(tbl[gi]) if gi in tbl else missing.append(gi))
+    if missing:
+        raise SystemExit(f"{len(missing)} calibration patients absent from {path}, "
+                         f"e.g. {missing[:5]}")
+    return np.stack(out)
+
+
 def save_snapshot(dst, E, flow, wemb, ckpt_dir, gibbs_meta, epoch):
     """Mid-training snapshot, in the same format load_gibbs_models expects.
 
@@ -358,10 +408,30 @@ def main():
     parser.add_argument("--latent-dim", type=int, default=128)
     parser.add_argument("--stats-path", default="norm_stats.json")
     parser.add_argument("--outputs-root", default="/home/sa4604/outputs/cv-sbi-spin")
-    parser.add_argument("--flow-arch", choices=["maf", "bounded-nsf"], default="maf",
+    parser.add_argument("--flow-arch", choices=["maf", "bounded-nsf", "mdn"],
+                        default="maf",
                         help="maf: the unconstrained Gaussian-base flow. bounded-nsf: "
                              "rational-quadratic splines on the prior box, so every "
-                             "draw is in-prior by construction (see bounded_nsf.py)")
+                             "draw is in-prior by construction (see bounded_nsf.py). "
+                             "mdn: the Route A baseline's mixture head, FiLM-conditioned "
+                             "on log w and unbounded (see mdn_flow.py)")
+    parser.add_argument("--mdn-hidden", type=int, default=128)
+    parser.add_argument("--mdn-components", type=int, default=8)
+    parser.add_argument("--mdn-layers", type=int, default=2)
+    parser.add_argument("--head-lr", type=float, default=None,
+                        help="learning rate for the density head and w embedding; "
+                             "--lr applies to the encoder. Default: --lr for both")
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--calib-every", type=int, default=0,
+                        help="score the held-out calibration patients every N epochs "
+                             "into calib_log_<ts>.csv; 0 disables")
+    parser.add_argument("--calib-samples", type=int, default=500)
+    parser.add_argument("--calib-theta", default=None,
+                        help="npz from scripts/export_hifi_theta.py giving ground-truth "
+                             "theta for the stand-in patients; required by --calib-every")
+    parser.add_argument("--val-eps-draws", type=int, default=1,
+                        help="average the validation NLL over this many independent "
+                             "noise realisations")
     parser.add_argument("--nsf-bins", type=int, default=10)
     parser.add_argument("--nsf-transforms", type=int, default=8)
     parser.add_argument("--nsf-hidden", type=int, default=256)
@@ -542,15 +612,17 @@ def main():
     # loadable under the cond_mode it was trained with, which gibbs_metric.json records
     use_enc = args.cond_mode in ("encoder", "concat")
     use_phi = args.cond_mode in ("phi", "concat")
-    cond_dim = ((args.latent_dim if use_enc else 0)
-                + (metric.d_eff if use_phi else 0) + W_EMBED_DIM)
+    w_cond_dim = 1 if args.flow_arch == "mdn" else W_EMBED_DIM
+    feature_dim = ((args.latent_dim if use_enc else 0)
+                   + (metric.d_eff if use_phi else 0))
+    cond_dim = feature_dim + w_cond_dim
     if args.resume_dir and src_meta.get("cond_mode", "encoder") != args.cond_mode:
         raise SystemExit(f"--resume-dir was trained with cond_mode "
                          f"{src_meta.get('cond_mode', 'encoder')!r}, not "
                          f"{args.cond_mode!r}; that is a different model")
     log(f"conditioning: {args.cond_mode}  cond_dim={cond_dim} "
         f"(E {args.latent_dim if use_enc else 0} + phi {metric.d_eff if use_phi else 0} "
-        f"+ w {W_EMBED_DIM})")
+        f"+ w {w_cond_dim})")
     if args.resume_dir:
         # a resume reproduces the source run's encoder exactly; --sn-ceiling does not
         # apply here, since a different ceiling is a different model
@@ -566,8 +638,17 @@ def main():
         E = LipschitzReducedAutoencoderEncoder(
             latent_dim=args.latent_dim, sn_ceiling=args.sn_ceiling,
             proj_hidden=None, n_scalars=N_SCALARS).to(device) if use_enc else None
-        wemb = WEmbed(center=(lo + hi) / 2, half_width=(hi - lo) / 2).to(device)
-        if args.flow_arch == "bounded-nsf":
+        wemb = (WPassthrough() if args.flow_arch == "mdn"
+                else WEmbed(center=(lo + hi) / 2, half_width=(hi - lo) / 2)).to(device)
+        if args.flow_arch == "mdn":
+            flow = build_mdn(theta_dim=theta_all.shape[1], feature_dim=feature_dim,
+                             theta_all=theta_all, hidden=args.mdn_hidden,
+                             n_components=args.mdn_components,
+                             n_hidden_layers=args.mdn_layers).to(device)
+            log(f"flow: conditional MDN, {args.mdn_components} components x "
+                f"{args.mdn_hidden} hidden, {args.mdn_layers} layers, FiLM on log w; "
+                f"unbounded support (draws are rejected downstream)")
+        elif args.flow_arch == "bounded-nsf":
             sys.path.insert(0, args.nested_sim_root)
             from nested_sim.params import (THETA_BOUNDS, LOG_SAMPLED,  # noqa: E402
                                            to_binary_names)
@@ -587,7 +668,14 @@ def main():
                                   hidden_features=128, num_transforms=5).to(device)
     flow_params = list(flow.parameters()) + list(wemb.parameters())
     enc_params = list(E.parameters()) if E is not None else []
-    opt = torch.optim.Adam(enc_params + flow_params, lr=args.lr)
+    head_lr = args.lr if args.head_lr is None else args.head_lr
+    opt = torch.optim.Adam([{"params": enc_params, "lr": args.lr},
+                            {"params": flow_params, "lr": head_lr}], lr=args.lr)
+    if head_lr != args.lr:
+        log(f"lr: encoder {args.lr:g}, density head {head_lr:g}")
+    n_enc = sum(p.numel() for p in enc_params)
+    n_head = sum(p.numel() for p in flow_params)
+    log(f"parameters: encoder {n_enc:,} + head {n_head:,} = {n_enc + n_head:,}")
     if args.resume_dir:
         opt.load_state_dict(torch.load(src / "opt_state.pt", weights_only=False))
 
@@ -603,29 +691,97 @@ def main():
         with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
             torch.manual_seed(args.val_seed)
             vx = val_x_t.to(device)
-            vlog_w = lo + (hi - lo) * torch.rand(vx.shape[0], 1, device=device)
-            val_pack = (val_theta.to(device), noisy_obs(vx, vlog_w, m_t, o_t), vlog_w)
+            vth = val_theta.to(device)
+            val_pack = []
+            for _ in range(max(1, args.val_eps_draws)):
+                vlog_w = lo + (hi - lo) * torch.rand(vx.shape[0], 1, device=device)
+                val_pack.append((vth, noisy_obs(vx, vlog_w, m_t, o_t), vlog_w))
             del vx
+        if len(val_pack) > 1:
+            log(f"validation NLL averaged over {len(val_pack)} noise realisations")
 
-    def val_nll_now():
-        """Mean NLL on the held-out slice, under the fixed noised batch."""
-        th, xn, lw = val_pack
+    def _eval_mode():
         if E is not None:
             E.eval()
         flow.eval(); wemb.eval()
+
+    def _cond(x_b, w_b):
+        parts = []
+        if use_enc:
+            parts.append(E(x_b))
+        if use_phi:
+            parts.append(phi_torch(x_b, m_t, o_t))
+        return torch.cat(parts + [wemb(w_b)], 1)
+
+    def val_nll_now():
+        """Mean NLL on the held-out slice, over the fixed noised batches."""
+        _eval_mode()
         tot, cnt = 0.0, 0
         with torch.no_grad():
-            for b in range(0, th.shape[0], args.val_batch):
-                t_b, x_b, w_b = th[b:b + args.val_batch], xn[b:b + args.val_batch], lw[b:b + args.val_batch]
-                parts = []
-                if use_enc:
-                    parts.append(E(x_b))
-                if use_phi:
-                    parts.append(phi_torch(x_b, m_t, o_t))
-                c = torch.cat(parts + [wemb(w_b)], 1)
-                tot += -flow.log_prob(t_b, condition=c).sum().item()
-                cnt += t_b.shape[0]
+            for th, xn, lw in val_pack:
+                for b in range(0, th.shape[0], args.val_batch):
+                    sl = slice(b, b + args.val_batch)
+                    c = _cond(xn[sl], lw[sl])
+                    tot += -flow.log_prob(th[sl], condition=c).sum().item()
+                    cnt += th[sl].shape[0]
         return tot / cnt
+
+    # Held-out scoring: the stand-in patients NOT used for metric estimation, with
+    # ground-truth theta recovered from the source target set. Nothing in training sees
+    # them -- the weights train on sims, the metric was fit on the other half, and the
+    # published benchmark draws from hifi_v2_test instead -- so they are legitimate for
+    # model selection. Unavailable on genuine patients, which have no theta, so this is a
+    # development instrument; see experiments.md on what transfers and what does not.
+    calib = None
+    if args.calib_every:
+        if not args.calib_theta:
+            raise SystemExit("--calib-every needs --calib-theta")
+        sys.path.insert(0, str(Path(args.nested_sim_root) / "scripts"))
+        import probscores as ps                                      # noqa: E402
+        keys = list(PARAM_KEYS_INFER)
+        box_lo, box_hi, box_logmask = prior_box(args.nested_sim_root, keys)
+        cal_theta = load_calib_theta(args.calib_theta, real_files, test_idx, keys)
+        cal_x_t = torch.from_numpy(real_x_t.numpy()[test_idx]).float().to(device)
+        u_true = to_unit_unclamped(cal_theta[:, None, :], box_lo, box_hi,
+                                   box_logmask)[:, 0, :]
+        pr_crps, pr_is = ps.prior_reference(u_true)
+        calib_logw = float(np.log(w_hat))
+        calib = True
+        log(f"held-out scoring: {len(cal_theta)} patients, {args.calib_samples} draws, "
+            f"every {args.calib_every} epochs at log w = {calib_logw:.4f} "
+            f"(w_hat = {w_hat:.6g})")
+        calib_fh = open(run_dir / f"calib_log_{ts}.csv", "w", newline="")
+        calib_w = csv.writer(calib_fh)
+        calib_w.writerow(["epoch", "crps", "crps_skill", "is95", "is95_skill", "cov95",
+                          "width95", "accept_median", "post_std_mean", "n_degenerate"])
+
+    def calib_now():
+        """Scores on the held-out stand-ins, plus the theta-free surrogates.
+
+        accept_median and post_std_mean need no ground truth, so they are the candidates
+        for a stopping rule that would also work on genuine patients; the rest need theta
+        and exist to tell us whether those surrogates track anything.
+        """
+        _eval_mode()
+        chunks = []
+        with torch.no_grad():
+            for b in range(0, cal_x_t.shape[0], args.val_batch):
+                x_b = cal_x_t[b:b + args.val_batch]
+                lw = torch.full((x_b.shape[0], 1), calib_logw, device=device)
+                d = flow.sample((args.calib_samples,), condition=_cond(x_b, lw))
+                chunks.append(d.transpose(0, 1).cpu().numpy())        # (B, n, 24)
+        samples = np.concatenate(chunks, 0)
+        u = to_unit_unclamped(samples, box_lo, box_hi, box_logmask)
+        in_box = ((u >= 0.0) & (u <= 1.0)).all(axis=2)
+        sc = ps.score_set(np.clip(u, -5.0, 6.0), u_true, in_box)
+        crps, is95 = float(np.nanmean(sc["crps_box"])), float(np.nanmean(sc["is_box"]))
+        return {"crps": crps, "crps_skill": 1.0 - crps / float(np.nanmean(pr_crps)),
+                "is95": is95, "is95_skill": 1.0 - is95 / float(np.nanmean(pr_is)),
+                "cov95": float(np.nanmean(sc["cov_box"])),
+                "width95": float(np.nanmean(sc["width_box"])),
+                "accept_median": float(np.median(in_box.mean(1))),
+                "post_std_mean": float(np.mean(u.std(axis=1))),
+                "n_degenerate": int(sc["n_degenerate"])}
 
     flow_end = args.flow_warmup
     enc_end = flow_end + args.enc_warmup
@@ -647,6 +803,7 @@ def main():
     log(f"Training: epochs {start_epoch}-{args.max_epochs}, {len(sim_dl)} batches/epoch, lr={args.lr}, "
         f"phases flow<={flow_end}, enc<={enc_end}, joint after")
     last_epoch = start_epoch - 1
+    best_val = float("inf")
     for epoch in range(start_epoch, args.max_epochs + 1):
         t0 = time.time()
         ph = phase(epoch)
@@ -675,7 +832,7 @@ def main():
             loss = -flow.log_prob(theta, condition=cond).mean()
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+            torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
             opt.step()
             total += loss.item() * x.shape[0]; n += x.shape[0]
         train_nll = total / n
@@ -688,6 +845,23 @@ def main():
         log(f"ep {epoch:4d} [{ph:4s}]  train_nll {train_nll:.4f}"
             + ("" if v is None else f"  val_nll {v:.4f}") + f"  ({dt:.0f}s)")
         last_epoch = epoch
+
+        if v is not None and v < best_val:
+            best_val = v
+            save_snapshot(ckpt_dir / "best_val", E, flow, wemb, ckpt_dir,
+                          gibbs_meta, epoch)
+
+        if calib and epoch % args.calib_every == 0:
+            c = calib_now()
+            calib_w.writerow([epoch] + [f"{c[k]:.6g}" for k in
+                             ("crps", "crps_skill", "is95", "is95_skill", "cov95",
+                              "width95", "accept_median", "post_std_mean")]
+                             + [c["n_degenerate"]])
+            calib_fh.flush()
+            log(f"       calib  CRPS {c['crps']:.4f} (skill {c['crps_skill']:+.3f})  "
+                f"IS95 {c['is95']:.4f} (skill {c['is95_skill']:+.3f})  "
+                f"cov95 {c['cov95']:.3f}  width95 {c['width95']:.4f}  "
+                f"accept {c['accept_median']:.3f}")
 
         if args.ckpt_every and epoch % args.ckpt_every == 0:
             save_snapshot(ckpt_dir / f"epoch{epoch:04d}", E, flow, wemb,
