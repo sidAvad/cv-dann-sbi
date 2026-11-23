@@ -176,17 +176,43 @@ Within the constrained "offset plus low-rank Gaussian" class the gross
 transport/scrambling failure is unavailable anyway: only the deterministic `mu(x)` can
 relocate samples, and the stochastic part can only spread.
 
-**OT instead of NN for matching.** As a *loss*, Wasserstein is no safer than MMD -- both
-compare marginals and neither references the pairing. As a *coupling* it genuinely helps:
-minimum-cost optimality (Brenier: gradient of a convex function) cannot permute arbitrarily,
-and mass balance stops every residual sitting at its individual minimum, which is the
-mechanism behind NN's 2.6x magnitude underestimate. Implemented as an injective min-cost
-bipartite matching on each observation's top-k candidate graph -- the m=1
-capacity-constrained transport problem, which keeps the bank large, unlike balanced OT
-against a bank subsampled to n_obs. Measured effect of NN's bias on the heteroscedasticity
-estimate: NN reports a `Pap mean` contrast of 8.24x where the paired truth is 6.21x, so
-~33% inflation from sparse bank coverage in the Pap tail. The metric fit itself is a fixed
-point (the coupling needs `phi`, which needs the metric), so iterate 2-3 rounds.
+**OT instead of NN for matching: tested, no benefit.** The reasoning was that NN lets
+every residual sit at its individual minimum and lets observations collapse onto shared
+bank sims, so a mass-balanced coupling should be less biased; minimum-cost optimality
+(Brenier: gradient of a convex function) also cannot permute arbitrarily, unlike a learned
+map. Implemented as an injective min-cost bipartite matching on each observation's top-50
+candidate graph (the m=1 capacity-constrained transport problem, which keeps the bank
+large, unlike balanced OT against a bank subsampled to n_obs). Measured against the
+theta-paired truth, 4000 observations, 250k bank:
+
+| residual | E\|\|r\|\|^2 | vs truth | implied w | cos to truth | Pap contrast |
+|---|---|---|---|---|---|
+| truth | 220.37 | 1.000 | 0.708 | 1.000 | 6.220 |
+| NN | 93.20 | 0.423 | 1.674 | 0.396 | 7.652 |
+| OT | 93.43 | 0.424 | 1.670 | 0.396 | 7.646 |
+
+Identical on every measure. The diagnostic explains it: only 129 of 4000 observations
+shared a bank sim under NN, so with the bank ~60x the observation count the injectivity
+constraint is essentially never binding and the joint optimum equals the individual
+optima. Mass balance only helps when observations *compete* for the same bank points.
+
+The corrected understanding: the 2.36x magnitude underestimate is **not** caused by
+collisions, it is the projection -- minimum-cost matching still minimises, just jointly --
+so every matching-by-proximity scheme inherits it, balanced or not. Do not revisit OT for
+residual estimation.
+
+What this does establish is the size of the oracle/deployable gap, which matters more than
+the magnitude bias alone: `cos to truth = 0.396` means the matched residual points only
+~40% along the true discrepancy, so a noise model fitted from it estimates a substantially
+rotated object. Matching also inflates the heteroscedasticity contrast by ~23%
+(6.22 -> 7.65 on `Pap mean` at matched sample size). Any deployable conditional noise model
+carries all three distortions and there is currently no known way to remove them.
+
+**Catheter-filter magnitude, for the record.** Applying `catheter_filter` post-hoc to the
+existing hifi beats, the filter term is 30-80% of the structural RMS per channel depending
+on `(fn, zeta)` and HR -- not negligible. But `calibrate_lowpass` puts the real spectra
+closest to *unfiltered* hifi, so a perturbation that size would move the benchmark away
+from the reals. Both results agree: do not add the layer.
 
 ## Bugs fixed
 
