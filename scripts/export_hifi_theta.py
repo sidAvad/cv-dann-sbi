@@ -34,9 +34,14 @@ def main():
     real_dir, target_dir = Path(a.real_dir), Path(a.target_dir)
     index = json.load(open(target_dir / "manifest.json"))["index"]
 
-    idx = sorted(int(m.group(1)) for m in
-                 (re.fullmatch(r"sim_(\d+)\.h5", p.name) for p in real_dir.glob("sim_*.h5"))
-                 if m)
+    # Row order must match load_real_beats, which iterates
+    # sorted(data_dir.glob("*.h5")) -- a LEXICOGRAPHIC sort of the filenames, so
+    # sim_1000.h5 precedes sim_200.h5. Sorting these indices numerically instead
+    # silently misaligns theta against the beats it is meant to label.
+    idx = [int(m.group(1)) for m in
+           sorted((m for m in (re.fullmatch(r"sim_(\d+)\.h5", p.name)
+                               for p in real_dir.glob("sim_*.h5")) if m),
+                  key=lambda m: m.string)]
     if not idx:
         raise SystemExit(f"no sim_<idx>.h5 files under {real_dir}")
     print(f"{len(idx)} stand-in files; target manifest has {len(index)} entries")
