@@ -211,13 +211,32 @@ def check_noise_consistency(sim_x, obs, metric, w_test, n_draws=256, tol=0.05, l
     measured = (delta ** 2).sum(1).mean()
     expected = metric.d_eff / w_test
     if correction is not None:
-        expected = (float((correction["mu_r"] ** 2).sum())
+        mu2 = np.atleast_2d(correction["mu_r"]) ** 2
+        if "bin_edges" in correction:
+            # each draw carries its own bin's offset, so average over the bins the
+            # draws actually land in rather than summing every bin's
+            b = bin_of(x0, m_t, o_t).numpy()
+            mu2_mean = float(mu2.sum(1)[b].mean())
+        else:
+            mu2_mean = float(mu2.sum())
+        expected = (mu2_mean
                     + (metric.d_eff + float(correction["a"].sum())) / w_test)
     rel = abs(measured - expected) / expected
     log(f"  noise check at w={w_test:.4g}: mean ||delta phi||^2 = {measured:.4g}, "
         f"expected = {expected:.4g}, rel err {rel:.3f}")
     if rel > tol:
         raise RuntimeError(f"noise/metric mismatch: rel err {rel:.3f} > {tol}")
+
+
+def bin_of(x, metric_t, obs_t):
+    """Bin index per row, from the raw peak of the binning channel.
+
+    Read off the observation, not theta, so the same lookup applies unchanged to a real
+    patient at inference.
+    """
+    c = metric_t["cor_ch"]
+    ch = x[:, c * T:(c + 1) * T] * obs_t["wave_std"][c] + obs_t["wave_mean"][c]
+    return torch.bucketize(ch.max(dim=1).values, metric_t["cor_edges"])
 
 
 def noisy_obs(x, log_w, metric_t, obs_t):
@@ -245,7 +264,8 @@ def noisy_obs(x, log_w, metric_t, obs_t):
     eps = eps * inv_sqrt_w
     mu = metric_t.get("cor_mu")
     if mu is not None:
-        eps = eps + mu
+        eps = eps + (mu[bin_of(x, metric_t, obs_t)]
+                     if "cor_edges" in metric_t else mu[0])
     z = eps[:, :NW * k].reshape(B, NW, k)
     e = eps[:, NW * k:]
 
@@ -285,7 +305,16 @@ def metric_to_torch(metric, obs, device, correction=None):
     if correction is not None:
         m["cor_U"] = torch.from_numpy(correction["U"].astype(np.float32)).to(device)
         m["cor_a"] = torch.from_numpy(correction["a"].astype(np.float32)).to(device)
-        m["cor_mu"] = torch.from_numpy(correction["mu_r"].astype(np.float32)).to(device)
+        m["cor_mu"] = torch.from_numpy(
+            np.atleast_2d(correction["mu_r"]).astype(np.float32)).to(device)
+        if "bin_edges" in correction:
+            # mu_r is (n_bins, d_eff) and the bin is read off the observation, so
+            # Sigma_c stays global: |Sigma_c| does not depend on theta, the log-det is
+            # constant and falls into the normaliser, and the target stays exactly Gibbs.
+            m["cor_edges"] = torch.from_numpy(
+                np.asarray(correction["bin_edges"], np.float32)).to(device)
+            m["cor_ch"] = int(WAVE_KEYS_REDUCED.index(
+                str(correction["bin_feature"]).split("_")[0]))
     return m, o
 
 
