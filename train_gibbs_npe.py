@@ -239,7 +239,7 @@ def bin_of(x, metric_t, obs_t):
     return torch.bucketize(ch.max(dim=1).values, metric_t["cor_edges"])
 
 
-def noisy_obs(x, log_w, metric_t, obs_t):
+def noisy_obs(x, log_w, metric_t, obs_t, mu_scale=None):
     """Apply metric-consistent noise to a batch in z-space. Fresh noise per call.
 
     The draw is made in phi coordinates, where the metric says the noise is white: the
@@ -264,8 +264,11 @@ def noisy_obs(x, log_w, metric_t, obs_t):
     eps = eps * inv_sqrt_w
     mu = metric_t.get("cor_mu")
     if mu is not None:
-        eps = eps + (mu[bin_of(x, metric_t, obs_t)]
-                     if "cor_edges" in metric_t else mu[0])
+        off = (mu[bin_of(x, metric_t, obs_t)]
+               if "cor_edges" in metric_t else mu[0].expand(B, -1))
+        if mu_scale is not None:
+            off = off * mu_scale
+        eps = eps + off
     z = eps[:, :NW * k].reshape(B, NW, k)
     e = eps[:, NW * k:]
 
@@ -346,6 +349,37 @@ class WEmbed(nn.Module):
 
     def forward(self, log_w):
         return self.net((log_w - self.center) / self.half_width)
+
+
+class WFiLM(nn.Module):
+    """log w modulates the conditioning features multiplicatively instead of being
+    concatenated alongside them.
+
+    Concatenation leaves w as 16 of 144 input dims against 128 encoder features that carry
+    nearly all the variance, so the conditioner can reach most of its likelihood reduction
+    without using w and the w pathway stays under-trained. A multiplicative gate cannot be
+    routed around. Follows mdn_flow.ConditionalMDN's FiLM (gamma = 2 tanh, zero-centred
+    shift) but standardises log w over the training range first, as WEmbed does -- the
+    window is known, so there is no reason to feed an unstandardised scalar.
+
+    forward returns the modulated features, so the caller appends nothing for w and
+    cond_dim equals feature_dim.
+    """
+
+    def __init__(self, feature_dim: int, center: float, half_width: float,
+                 hidden: int = 64):
+        super().__init__()
+        self.center = float(center)
+        self.half_width = float(half_width)
+        self.net = nn.Sequential(nn.Linear(1, hidden), nn.SiLU(),
+                                 nn.Linear(hidden, feature_dim * 2))
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)   # starts as gamma=0 -> h unchanged by scale
+
+    def forward(self, h, log_w):
+        u = (log_w - self.center) / self.half_width
+        gamma, shift = torch.chunk(self.net(u), 2, dim=-1)
+        return torch.tanh(gamma) * 2.0 * h + shift
 
 
 def prior_box(nested_sim_root, keys):
@@ -483,6 +517,23 @@ def main():
     parser.add_argument("--w-hi", type=float, default=None,
                         help="Upper end of the log-uniform w training range, in absolute "
                              "units. Must be given with --w-lo. Default: 10*w_hat.")
+    parser.add_argument("--w-cond", choices=["concat", "film"], default="concat",
+                        help="How log w enters the conditioning. concat: WEmbed features "
+                             "appended to the encoder output (default). film: log w gates "
+                             "the encoder features multiplicatively, so the conditioner "
+                             "cannot ignore it. Not available for --flow-arch mdn, whose "
+                             "head already FiLMs on w internally.")
+    parser.add_argument("--lr-cosine", action="store_true",
+                        help="Cosine-decay the learning rate to zero over --max-epochs. "
+                             "Lets a higher --lr be used early without carrying it late.")
+    parser.add_argument("--mu-scale-range", type=float, nargs=2, default=None,
+                        metavar=("LO", "HI"),
+                        help="Amortize over the offset's MAGNITUDE: draw c ~ U[LO, HI] "
+                             "per sample, use c*mu_r as the offset, and condition on c. "
+                             "The eval then sweeps c, with c=0 the no-offset baseline "
+                             "and c=1 the fitted value. mu_r's direction is far better "
+                             "determined than its size, so one scalar covers the "
+                             "uncertainty that matters. Needs --correction.")
     parser.add_argument("--correction", default=None,
                         help="npz with mu_r, U, a: the low-rank enrichment of the noise "
                              "covariance, Sigma_c = I + U diag(a) U^T, plus a mean "
@@ -638,7 +689,7 @@ def main():
         gibbs_meta["correction"] = {
             "path": args.correction, "rank": int(correction["rank"]),
             "projected": bool(correction["projected"]),
-            "w_self_consistent": float(correction["w"]),
+            "w_self_consistent": np.atleast_1d(correction["w"]).tolist(),
             "mu_r_sq": float((correction["mu_r"] ** 2).sum()),
             "a_sum": float(correction["a"].sum())}
         np.savez(ckpt_dir / "gibbs_correction.npz", **correction)
@@ -652,10 +703,17 @@ def main():
     # loadable under the cond_mode it was trained with, which gibbs_metric.json records
     use_enc = args.cond_mode in ("encoder", "concat")
     use_phi = args.cond_mode in ("phi", "concat")
-    w_cond_dim = 1 if args.flow_arch == "mdn" else W_EMBED_DIM
+    if args.w_cond == "film" and args.flow_arch == "mdn":
+        raise SystemExit("--w-cond film is redundant for the mdn head, which FiLMs on w "
+                         "internally; use --w-cond concat")
+    # film modulates the features in place, so nothing is appended for w
+    w_cond_dim = (0 if args.w_cond == "film"
+                  else (1 if args.flow_arch == "mdn" else W_EMBED_DIM))
     feature_dim = ((args.latent_dim if use_enc else 0)
                    + (metric.d_eff if use_phi else 0))
-    cond_dim = feature_dim + w_cond_dim
+    mu_lo, mu_hi = (args.mu_scale_range if args.mu_scale_range else (1.0, 1.0))
+    mu_cond_dim = 1 if args.mu_scale_range else 0
+    cond_dim = feature_dim + w_cond_dim + mu_cond_dim
     if args.resume_dir and src_meta.get("cond_mode", "encoder") != args.cond_mode:
         raise SystemExit(f"--resume-dir was trained with cond_mode "
                          f"{src_meta.get('cond_mode', 'encoder')!r}, not "
@@ -678,8 +736,13 @@ def main():
         E = LipschitzReducedAutoencoderEncoder(
             latent_dim=args.latent_dim, sn_ceiling=args.sn_ceiling,
             proj_hidden=None, n_scalars=N_SCALARS).to(device) if use_enc else None
-        wemb = (WPassthrough() if args.flow_arch == "mdn"
-                else WEmbed(center=(lo + hi) / 2, half_width=(hi - lo) / 2)).to(device)
+        if args.w_cond == "film":
+            wemb = WFiLM(feature_dim, center=(lo + hi) / 2,
+                         half_width=(hi - lo) / 2).to(device)
+        elif args.flow_arch == "mdn":
+            wemb = WPassthrough().to(device)
+        else:
+            wemb = WEmbed(center=(lo + hi) / 2, half_width=(hi - lo) / 2).to(device)
         if args.flow_arch == "mdn":
             flow = build_mdn(theta_dim=theta_all.shape[1], feature_dim=feature_dim,
                              theta_all=theta_all, hidden=args.mdn_hidden,
@@ -713,6 +776,12 @@ def main():
                             {"params": flow_params, "lr": head_lr}], lr=args.lr)
     if head_lr != args.lr:
         log(f"lr: encoder {args.lr:g}, density head {head_lr:g}")
+    sched = None
+    if args.lr_cosine:
+        # per-epoch cosine to zero over the full schedule, so a higher --lr applies early
+        # and decays out rather than being carried to the end
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.max_epochs)
+        log(f"lr schedule: cosine {args.lr:g} -> 0 over {args.max_epochs} epochs")
     n_enc = sum(p.numel() for p in enc_params)
     n_head = sum(p.numel() for p in flow_params)
     log(f"parameters: encoder {n_enc:,} + head {n_head:,} = {n_enc + n_head:,}")
@@ -735,7 +804,8 @@ def main():
             val_pack = []
             for _ in range(max(1, args.val_eps_draws)):
                 vlog_w = lo + (hi - lo) * torch.rand(vx.shape[0], 1, device=device)
-                val_pack.append((vth, noisy_obs(vx, vlog_w, m_t, o_t), vlog_w))
+                vmu = (torch.ones(vx.shape[0], 1) if args.mu_scale_range else None)
+                val_pack.append((vth, noisy_obs(vx, vlog_w, m_t, o_t, vmu), vlog_w))
             del vx
         if len(val_pack) > 1:
             log(f"validation NLL averaged over {len(val_pack)} noise realisations")
@@ -745,13 +815,24 @@ def main():
             E.eval()
         flow.eval(); wemb.eval()
 
-    def _cond(x_b, w_b):
+    def _cond(x_b, w_b, mu_c=1.0):
+        """mu_c defaults to 1: validation and held-out scoring use the FITTED offset, so
+        they stay comparable across epochs and against a run without amortization."""
         parts = []
         if use_enc:
             parts.append(E(x_b))
         if use_phi:
             parts.append(phi_torch(x_b, m_t, o_t))
-        return torch.cat(parts + [wemb(w_b)], 1)
+        if args.w_cond == "film":
+            c = wemb(torch.cat(parts, 1), w_b)
+            if args.mu_scale_range:
+                c = torch.cat([c, torch.full((x_b.shape[0], 1), float(mu_c),
+                                             device=x_b.device)], 1)
+            return c
+        extra = [wemb(w_b)]
+        if args.mu_scale_range:
+            extra.append(torch.full((x_b.shape[0], 1), float(mu_c), device=x_b.device))
+        return torch.cat(parts + extra, 1)
 
     def val_nll_now():
         """Mean NLL on the held-out slice, over the fixed noised batches."""
@@ -845,6 +926,8 @@ def main():
     last_epoch = start_epoch - 1
     best_val = float("inf")
     for epoch in range(start_epoch, args.max_epochs + 1):
+        if sched is not None and epoch > start_epoch:
+            sched.step()
         t0 = time.time()
         ph = phase(epoch)
         train_E = E is not None and ph != "flow"
@@ -862,13 +945,21 @@ def main():
         for theta, x in sim_dl:
             theta, x = theta.to(device, non_blocking=True), x.to(device, non_blocking=True)
             log_w = lo + (hi - lo) * torch.rand(x.shape[0], 1, device=device)
-            x_noisy = noisy_obs(x, log_w, m_t, o_t)
+            mu_c = (mu_lo + (mu_hi - mu_lo) * torch.rand(x.shape[0], 1, device=device)
+                    if args.mu_scale_range else None)
+            x_noisy = noisy_obs(x, log_w, m_t, o_t, mu_c)
             parts = []
             if use_enc:
                 parts.append(E(x_noisy))
             if use_phi:
                 parts.append(phi_torch(x_noisy, m_t, o_t))
-            cond = torch.cat(parts + [wemb(log_w)], 1)
+            if args.w_cond == "film":
+                cond = wemb(torch.cat(parts, 1), log_w)
+                if mu_c is not None:
+                    cond = torch.cat([cond, mu_c], 1)
+            else:
+                extra = [wemb(log_w)] + ([mu_c] if mu_c is not None else [])
+                cond = torch.cat(parts + extra, 1)
             loss = -flow.log_prob(theta, condition=cond).mean()
             opt.zero_grad(set_to_none=True)
             loss.backward()
