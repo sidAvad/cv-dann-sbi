@@ -571,12 +571,23 @@ def main():
     correction = None
     if args.correction:
         correction = dict(np.load(args.correction))
+        mu2 = (np.atleast_2d(correction["mu_r"]) ** 2).sum(1)
+        wv = np.atleast_1d(correction["w"])
         log(f"Noise correction from {args.correction}: rank {int(correction['rank'])}, "
             f"projected={bool(correction['projected'])}, "
-            f"||mu_r||^2={float((correction['mu_r']**2).sum()):.4g}, "
             f"a in [{float(correction['a'].min()):.3g}, "
-            f"{float(correction['a'].max()):.3g}], "
-            f"self-consistent w={float(correction['w']):.4g}")
+            f"{float(correction['a'].max()):.3g}]")
+        if "bin_edges" in correction:
+            ed = np.asarray(correction["bin_edges"])
+            log(f"  per-bin offset on {str(correction['bin_feature'])}, "
+                f"{len(mu2)} bins, edges {np.round(ed, 3)}")
+            log(f"  ||mu_b||^2 {np.round(mu2, 3)}   self-consistent w_b "
+                f"{np.round(wv, 4)}   s_b {np.round(wv / float(correction['w_global']), 3)}")
+            log("  Sigma_c is global, so the bin shifts only the offset; the per-bin "
+                "scale is applied at evaluation via --percase-w")
+        else:
+            log(f"  ||mu_r||^2={float(mu2.sum()):.4g}, "
+                f"self-consistent w={float(wv[0]):.4g}")
 
     start_epoch = 1
     if args.resume_dir:
