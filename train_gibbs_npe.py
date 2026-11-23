@@ -656,6 +656,10 @@ def main():
         w_hat = mmeta["w_hat"]
         log(f"Frozen metric from {mdir}: ell={metric.ell:.4f}, k_t={metric.k}, "
             f"d_eff={mmeta['d_eff']}, w_hat={w_hat:.6g}; weights train from scratch")
+        # also verify here, not only on the estimate path: a correction fitted in a
+        # different metric's phi (wrong d_eff, wrong U shape) is otherwise caught by
+        # nothing until the noise is silently wrong
+        check_noise_consistency(sim_x, obs, metric, w_hat, log=log, correction=correction)
     else:
         log("Stage 1-2: estimating metric M and w_hat on calibration patients...")
         metric, w_hat, cal_info = estimate_metric(sim_x, obs, cal_x, log=log)
