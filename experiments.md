@@ -63,6 +63,66 @@ Consequence: `PR = 26/156` is **not** a benchmark artefact. The anisotropy is ge
 structural discrepancy, so the `I` in `Sigma_c = I + sum a_i u_i u_i^T` is genuinely
 misspecified.
 
+**Per-bin w at inference: the likelihood gain does not reach the posterior.** The
+conditional noise model's dominant term is the per-bin SCALE (held-out log-lik +16.1 nats,
+against +1.2 for the per-bin offset). The scale needs no retraining: training draws
+log w over the window independent of theta and conditions on it, so the Bayes-optimal
+conditional is the Gibbs posterior at whatever w is supplied, and plugging in w_b at
+evaluation IS the x-dependent-scale noise model's target. Tested on four already-trained
+arms, same weights and cases, only w changed (w_i = W_PER_SET[level] * s_b, anchored so
+the harmonic mean reproduces the calibrated scalar -- harmonic because 1/w_global =
+mean_b(1/w_b)):
+
+| arm | CRPS | IS | cov |
+|---|---|---|---|
+| lr29full ep400 | +0.220 -> +0.230 | -0.104 -> -0.099 | 0.905 -> 0.905 |
+| v2realcal ep400 | +0.192 -> +0.198 | -0.328 -> -0.343 | 0.876 -> 0.874 |
+| bnsf400 real-pt | +0.214 -> +0.228 | +0.019 -> +0.003 | 0.925 -> 0.923 |
+| bnsf800 real-pt | +0.220 -> +0.232 | -0.001 -> -0.022 | 0.923 -> 0.921 |
+
+About +0.01 CRPS for about -0.02 IS, coverage flat -- the same sharpness-for-calibration
+trade seen everywhere else, not a win. On hifi_v2strong it is worse (bnsf800 IS
+-0.285 -> -0.353). The clamping caveat did materialise (34.6% / 41.9% of cases clamped on
+the real-pt arms, whose window floors at 0.755) but the UNCLAMPED v2realcal arms show the
+same pattern, so clamping is not hiding a win; nor is the flow failing to respond to w
+(width moved 0.727 -> 0.709, coverage held). A 16-nat improvement in how well the noise
+model describes the residual distribution is close to orthogonal to posterior quality.
+
+Since the scale is the big term and it is obtainable free, and the offset term is 13x
+smaller on the same measure, this argues against a bin-specific training run. The
+`--correction` loader supports a per-bin offset (bin read off the observation, Sigma_c
+global) and `--mu-scale-range` amortizes the offset MAGNITUDE over c ~ U[lo,hi] with
+`mu = c * mu_hat_b`, both committed but used by no run. Revive only with a reason the
+scale result does not already cover.
+
+**Training dynamics: the hifi/lofi trajectory is invariant to learning rate, architecture
+and capacity.** Hypothesis was that 980k sims at lr 1e-4 with 3.79M flow params forces an
+over-long schedule, and that a higher lr with adaptive decay would land somewhere better
+by epoch 400-800. Tested by plotting hifi CRPS against lofi CRPS parametrically along each
+arm's epoch ladder, which removes "how far along" from the comparison:
+
+| arm (lr, arch) | lofi | hifi |
+|---|---|---|
+| MDN ep100 (1e-3, mixture, 133k) | 0.359 | +0.225 |
+| lr29full ep400 (1e-4, NSF, 3.79M) | 0.395 | +0.220 |
+| MDN ep400 | 0.401 | +0.202 |
+| MDN ep800 | **0.415** | **+0.168** |
+| wpaired ep400 (1e-4, NSF) | **0.415** | **+0.179** |
+| lr29full ep800 | 0.432 | +0.160 |
+| wpaired ep800 | 0.442 | +0.129 |
+
+At lofi 0.415 the MDN gives +0.168 and wpaired +0.179 -- within 0.011 on a 0.10 range,
+across a 10x learning-rate difference, a different flow family and 28x fewer density
+parameters. The arms walk one curve at different speeds; the MDN reaching ep800's position
+by ep150 and then continuing down it is the same fact. So lr buys ITERATION SPEED, not
+quality, and a higher lr with cosine decay is worth having for that reason alone -- every
+question this session was gated on 13-19 hour runs.
+
+What does move the curve is the metric's calibration source: the real-patient arms sit
+about +0.06 higher in hifi at matched lofi (bnsf800 at lofi 0.427 reaches +0.220 where the
+v2realcal family reaches about +0.160). That remains the only lever that shifts the curve
+rather than sliding along it.
+
 ## Positive findings
 
 **Low-rank `Sigma_c` works, full beats projected.** `lr29full` (rank 29, unprojected)
@@ -130,6 +190,32 @@ are ruled out for a more basic reason: one observation gives one residual vector
 the posterior. Pool at regime level; `s_b` must come from pooled `||r||^2` within a bin, not
 from averaging per-case w, since `w_i` is heavily right-skewed (pooled 0.697 vs per-case
 median 3.69).
+
+**The w-conditioning is under-weighted, and it is a gain deficiency rather than a support
+limit.** Measured on wpaired ep800 -- the only arm whose window ([0.0713, 7.13]) reaches
+low w unclamped, and Sigma_c = I so the uncorrected Laplace curve applies directly -- over
+a w grid matched between the two:
+
+| w | Laplace width95 | flow width95 | flow/true |
+|---|---|---|---|
+| 0.08 | 0.918 | 0.695 | 0.757 |
+| 0.60 | 0.792 | 0.647 | 0.817 |
+| 1.033 | 0.755 | 0.634 | 0.839 |
+| 7.0 | 0.617 | 0.596 | 0.966 |
+
+True compression 1.488x, flow 1.167x; the shortfall grows smoothly from 3% at w=7 to 24%
+at w=0.08. Two observations rule out a representational ceiling: the flow's width does not
+plateau (it keeps widening to w=0.08), and the prior reference width is 0.950 while the
+flow sits at 0.695, so a quarter of the range is unused. A bounded-spline support limit
+would show saturation pressed against 0.950.
+
+So the conditioner under-uses w. log w is a SCALAR, so a wider embedding is the wrong fix
+-- 16 dims is already over-complete for a 1-D input. The plausible mechanism is routing:
+w occupies 16 of 144 conditioning dims against 128 encoder features carrying nearly all
+the variance, so the flow reaches most of its likelihood reduction without it. Hence
+`--w-cond film`, a multiplicative gate that cannot be routed around. The rank-29
+correction barely moves the Laplace target (1.472x vs 1.488x), so none of this depends on
+the correction question.
 
 ## Conditional noise model: the design, and why
 
@@ -226,6 +312,22 @@ After the fix, +0.255. Nothing was trained on it; it was diagnostic only. Commit
 **`resolve_gibbs_ckpt` resolving to incomplete checkpoints.** Some runs have later
 timestamped dirs holding a metric but no `flow_net.pt` (relaunches that died during the sim
 load). Now skips dirs without a flow.
+
+**`check_noise_consistency` never ran on the frozen-metric path.** It was called only
+where the metric is ESTIMATED, so every `--metric-dir` run skipped it -- the lr29proj,
+lr29full and wpaired arms, and both real-patient-calibrated runs. A correction fitted in a
+different metric's phi (wrong d_eff, wrong U shape) would have gone uncaught until the
+injected noise was silently wrong. Now runs on both paths; it passes at 1.4% relative
+error for the d_eff 180 refit. No evidence any earlier run was actually wrong, but none
+of them was verified.
+
+**The rank-29 correction could not be reused across metrics.** `cor_r29_full.npz` holds
+`U` as (156, 29) in the v2realcal metric's phi; the real-patient metric has d_eff 180, so
+it will not load at all. Refitting at d_eff 180 (theta_paired_gate then build_correction,
+both with `--ck` pointing at the real-patient checkpoint) gives rank **32**,
+`a_i` in [3.73, 53.51], `||mu_r||^2 = 7.578`, self-consistent w 3.928, and theta-subspace
+energy 35.5% against 35.3% at d_eff 156 -- the refit agrees with the original geometry.
+A correction is tied to the metric that defined its phi; it is not a portable artifact.
 
 ## Non-findings worth recording
 
