@@ -545,6 +545,12 @@ def main():
                              "they are never trained on. 0 disables validation.")
     parser.add_argument("--val-every", type=int, default=1,
                         help="Compute the validation NLL every N epochs.")
+    parser.add_argument("--patience", type=int, default=0,
+                        help="Stop when the validation NLL has not improved on its best "
+                             "for this many epochs. 0 disables it. Val NLL is noisy "
+                             "relative to its own trend -- see experiments.md -- so a "
+                             "short patience fires on noise; 50 is the smallest value "
+                             "that tracked the trend on the runs measured so far.")
     parser.add_argument("--val-seed", type=int, default=1234,
                         help="Seed for the validation set's log w draw and its noise. The "
                              "noised validation batch is built ONCE and reused every epoch, "
@@ -928,7 +934,7 @@ def main():
     log(f"Training: epochs {start_epoch}-{args.max_epochs}, {len(sim_dl)} batches/epoch, lr={args.lr}, "
         f"phases flow<={flow_end}, enc<={enc_end}, joint after")
     last_epoch = start_epoch - 1
-    best_val = float("inf")
+    best_val, best_epoch = float("inf"), start_epoch - 1
     for epoch in range(start_epoch, args.max_epochs + 1):
         if sched is not None and epoch > start_epoch:
             sched.step()
@@ -982,9 +988,13 @@ def main():
         last_epoch = epoch
 
         if v is not None and v < best_val:
-            best_val = v
+            best_val, best_epoch = v, epoch
             save_snapshot(ckpt_dir / "best_val", E, flow, wemb, ckpt_dir,
                           gibbs_meta, epoch)
+        elif args.patience and v is not None and epoch - best_epoch >= args.patience:
+            log(f"early stop: val_nll has not improved on {best_val:.4f} (ep "
+                f"{best_epoch}) for {epoch - best_epoch} epochs")
+            break
 
         if calib and epoch % args.calib_every == 0:
             c = calib_now()
