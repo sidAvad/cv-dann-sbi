@@ -351,12 +351,51 @@ below by 0 and unbounded above, so a mean lets those two dominate. **Use the med
 `train_gibbs_npe.py` now logs `ratio_inf_median` as the headline and keeps the mean
 alongside.
 
-**Conclusion: (a) vs (b) is still undecided, and no flow has reached the target.** On
-every robust summary all three arms are sharper than the Laplace Gibbs posterior, the best
-hifi arm being the least sharp. Since nothing has arrived at the target, what being *at*
-it does on hifi has never been observed, so "the target is too sharp for hifi" remains
-untested rather than supported. The earlier confident readings in both directions were
-estimator artifacts.
+**Anchored on the gold SMC: (a).** The gold campaign
+(`smc_nestedsim_v5_gold`, 16 lofi_test cases at `w = 7.5539`) targets the exact same Gibbs
+posterior, so it validates the Laplace's absolute level and supplies the calibration
+constant that the estimator question could not settle.
+`scripts/laplace_vs_gold_smc.py`, with a case-matched cache built via
+`laplace_width.py --indices`:
+
+- **The Laplace level is accurate to ~2%.** Pooled over the 9 cases with >= 20 final
+  lineages: SMC 0.7010 against Laplace 0.7143, ratio of means 0.981; per case 0.87-1.07.
+  The "worth 10-20%" caveat carried until now was too pessimistic.
+- **The exact Gibbs posterior scores `median inf` 0.915** (9 clean cases) **to 0.937**
+  (all 16). The Laplace overstates informative-parameter widths by ~8%, so **0.92, not
+  1.0, is where a model that has reached the target sits.**
+
+Matched comparison -- same 16 cases, same `w = 7.5539`, same estimator:
+
+| model | `median inf` | hifi IS |
+|---|---|---|
+| **SMC, the exact Gibbs posterior** | **0.915 - 0.937** | -- |
+| bnsf800, Lipschitz 2.0 | **0.943** | -0.022 |
+| bnsf800, no ceiling | 0.839 | -0.232 |
+| bnsf1600, no ceiling | 0.779 | -0.819 |
+
+`lip800` is indistinguishable from the exact posterior; the other two are ~10% and ~16%
+sharper, and hifi IS degrades monotonically with that excess sharpness. **The Gibbs target
+is sound and the degradation is flows overshooting past it** -- hypothesis (a). The
+Lipschitz ceiling is what holds `lip800` at the target.
+
+Two limits on that. The SMC anchor is at `w = 7.5539` while the headline flow sweep was at
+`w = 1.033`, and the ratio is `w`-dependent. And **no arm sits above the target**, so
+"deliberately wider than Gibbs would be better still" is untested.
+
+**The gold SMC also settles the estimator question outright.** Mean-of-ratios assigns the
+*exact sampler* 2.13 (9 clean cases) to 3.01 (all 16), with cases 11 and 16 at 10.6 and
+10.8. A statistic that scores ground truth at 3x cannot be used. Median only.
+
+**Queued: SMC on hifi-realistic observations** (16 matched cases, `w = 1.033`,
+`scripts/run_hifi_smc_parallel.sh`, behind the in-flight trainings). All of the above
+establishes flow fidelity *on lofi*; the degradation lives on hifi, and `lip800` matching
+the target's width on lofi does not imply its hifi posterior equals the Gibbs posterior on
+hifi observations, which are off-manifold for a lofi-trained flow. The run forks the next
+step: if the exact Gibbs posterior scores near `lip800`'s -0.022 on hifi, the target is the
+binding constraint and further work on flow fidelity is wasted; if it scores much better,
+there is headroom a better-fit flow can take. Note `hifi_v2_test` and `lofi_test` are
+paired on the same theta, so every case is comparable against its lofi gold counterpart.
 
 **AVD and Tmax_a are a caveat on the instrument itself.** Both are timing parameters, both
 have tight Laplace targets (0.196, 0.408), and the flows are 2-4x wider than the target on
