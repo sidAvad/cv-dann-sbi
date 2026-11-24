@@ -985,10 +985,16 @@ def main():
         expanded at an observation whose mode sits at theta_true, so feeding a noised
         draw would compare against the wrong reference. Samples are left unclamped so an
         over-wide flow is not silently trimmed to the box.
+
+        Sampling runs in a forked RNG at a fixed seed, so the diagnostic neither advances
+        the training noise stream -- enabling it leaves the trained weights bit-identical
+        -- nor contributes its own scatter to the epoch-to-epoch ratio.
         """
         _eval_mode()
         chunks = []
-        with torch.no_grad():
+        with torch.no_grad(), torch.random.fork_rng(
+                devices=[device] if device.type == "cuda" else []):
+            torch.manual_seed(args.val_seed)
             for b in range(0, lap_x.shape[0], args.val_batch):
                 x_b = lap_x[b:b + args.val_batch]
                 lw = torch.full((x_b.shape[0], 1), lap_logw, device=device)
