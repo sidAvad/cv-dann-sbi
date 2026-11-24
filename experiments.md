@@ -300,7 +300,7 @@ on `(fn, zeta)` and HR -- not negligible. But `calibrate_lowpass` puts the real 
 closest to *unfiltered* hifi, so a perturbation that size would move the benchmark away
 from the reals. Both results agree: do not add the layer.
 
-## The Laplace width diagnostic: a working instrument, an undecided question
+## The Laplace width diagnostic: the flows that degrade have overshot the target
 
 Every score we had measures the flow against data. None of them answers whether the flow
 has reached the Gibbs posterior it was *trained* to target, and that distinction carries
@@ -422,17 +422,11 @@ all-parameter ratio for the Lipschitz arm crosses 1 inside the window: 0.967 at 
 1.295 / 1.287 / 1.277 at ep500/600/700/800 -- monotone toward the target, at roughly 0.01
 per 100 epochs. Direction is robust even if the level is not.
 
-**Caveats.** A local linearisation at the validation sims' true `theta`, worth perhaps
-10-20% in absolute terms. It measures width only: right width with the wrong centre scores
-1.0.
-
-**Owed: SMC on hifi realistic.** This is now the decisive run, not a validation detail.
-The claim is that the Gibbs target is too sharp for hifi; SMC with the lofi simulator at
-the same metric and `w`, on hifi-realistic observations, *is* the exact Gibbs posterior
-there, so scoring it gives the ceiling of the whole Gibbs approach directly. The
-prediction: its hifi IS lands near the on-target arm's -0.232, well short of the
-deliberately-wide -0.022. A second, cheaper SMC run on clean lofi would separately
-validate the Laplace's absolute level, which the ~1.28 operating point now depends on.
+**Caveats.** A local linearisation at the validation sims' true `theta`; the gold SMC puts
+its absolute error at ~2% pooled and ~7% per case, far better than the 10-20% feared, but
+the operating point is an empirical 0.92 rather than a derived 1.0. It measures width
+only: right width with the wrong centre scores 1.0 -- which is exactly what the queued
+hifi SMC probes.
 
 ## Bugs fixed
 
