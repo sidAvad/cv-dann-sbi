@@ -135,9 +135,18 @@ def build_cache(a):
     metric = Metric.from_npz(Path(a.metric_dir) / "gibbs_metric.npz", meta_j["ell"])
     stats = load_stats(a.stats_path or (data_root / "lofi_train/norm_stats.json"))
 
-    man, kept = _keep_positions(lo_root, load_manifest)
-    sel = np.random.RandomState(a.seed).choice(len(kept), a.n_cases, replace=False)
-    entries = [man["index"][kept[s]] for s in sel]
+    if a.indices:
+        # Explicit manifest positions, for comparing against artifacts that already fixed
+        # their own cases (the gold SMC campaign indexes the manifest directly). The QC /
+        # metric-holdout filtering is bypassed: the caller has already chosen.
+        man = load_manifest(lo_root / "manifest.json")
+        pos = [int(v) for v in a.indices.split(",")]
+        entries = [man["index"][i] for i in pos]
+    else:
+        man, kept = _keep_positions(lo_root, load_manifest)
+        sel = np.random.RandomState(a.seed).choice(len(kept), a.n_cases, replace=False)
+        pos = [int(kept[s]) for s in sel]
+        entries = [man["index"][p] for p in pos]
 
     # The flow's own input, built by the training dataset class itself so the layout and
     # normalization cannot drift from what the flow was trained on.
@@ -193,6 +202,7 @@ def build_cache(a):
     meta = {"metric_dir": str(a.metric_dir), "split": a.split, "ell": meta_j["ell"],
             "d_eff": meta_j["d_eff"], "h": a.h, "ss_tol": a.ss_tol, "seed": a.seed,
             "n_requested": a.n_cases, "param_keys": keys,
+            "manifest_positions": [int(pos[c]) for c in keep_ci],
             "cases": [f"{entries[c]['file']}/{entries[c]['group']}" for c in keep_ci]}
     np.savez_compressed(a.out, J=J, x=x[keep_ci], theta=theta[keep_ci],
                         meta=json.dumps(meta))
@@ -217,6 +227,9 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--correction", default="", help="Sigma_c npz, for the printed sweep")
     ap.add_argument("--n-cases", type=int, default=60)
+    ap.add_argument("--indices", default="",
+                    help="explicit comma-separated manifest positions instead of a random "
+                         "draw; use when matching cases another artifact already fixed")
     ap.add_argument("--workers", type=int, default=192)
     ap.add_argument("--h", type=float, default=2e-3, help="FD step, fraction of the box")
     ap.add_argument("--ss-tol", type=float, default=1e-6)
