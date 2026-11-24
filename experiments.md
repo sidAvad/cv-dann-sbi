@@ -418,9 +418,35 @@ all-parameter ratio for the Lipschitz arm crosses 1 inside the window: 0.967 at 
 1.022 at 7.55, 1.199 at 75.5, while the target moves 0.7725 -> 0.4590 and the flow only
 0.747 -> 0.550. A single-`w` ratio is therefore not a property of an arm.
 
-**Epoch trend, bnsf800-Lipschitz** (`MoR inf`, the column measured at the time): 1.310 /
-1.295 / 1.287 / 1.277 at ep500/600/700/800 -- monotone toward the target, at roughly 0.01
-per 100 epochs. Direction is robust even if the level is not.
+**Epoch ladder: the Lipschitz arm approaches Gibbs exactness from ABOVE and has not
+arrived.** `MED inf` at the SMC's own `w = 7.5539` on the 16 gold cases, pinned to single
+training trajectories (`laplace_ladder.py --ckpt-ts`):
+
+| epoch | 100 | 200 | 300 | 400 | 500 | 600 | 700 | 800 | *SMC* |
+|---|---|---|---|---|---|---|---|---|---|
+| MED inf | 1.072 | 1.028 | 0.992 | 0.965 | 0.961 | 0.956 | 0.948 | 0.943 | *0.915-0.937* |
+
+ep100-400 are `bnsf400`, ep500-800 are `bnsf800`: separate runs, same metric and
+configuration. They **join smoothly at 400 -> 500 (0.965 -> 0.961)**, which cross-validates
+the statistic across independent runs rather than only within one. The trajectory is
+monotone, crosses the Laplace's nominal 1.0 near ep290, and at ep800 sits just above the
+exact band -- roughly 1-3% wider than exact, entering the band around ep920 on the late
+slope of ~0.005 per 100 epochs. So the best-scoring arm has **not** overshot; the arms that
+degrade (0.839, 0.779) have.
+
+**`--ckpt-ts` exists because the first version of this ladder was spliced.** The bnsf800
+run directory holds three timestamps: only `20261110-141344` is complete (`last_epoch` 800,
+`status` complete); `142121` and `143008` are killed relaunches still marked `running`,
+each carrying ep500-700 snapshots. `resolve_gibbs_ckpt` returns the LAST directory holding
+a requested snapshot, so an un-pinned ladder read ep500/600/700 off a killed relaunch and
+ep800 off the real run, reporting a "trend" across three different trajectories. The ep800
+numbers elsewhere in this section are unaffected, since only `141344` has an ep800.
+
+**Open: which ratio is optimal is still inferred, not measured.** Checkpoints now exist at
+1.072, 1.028, 0.992 and 0.965 -- genuinely wider than exact -- but hifi evals exist only at
+ep400 of `bnsf400`, so hifi IS against `MED inf` can only be read at four well-separated
+arms rather than along the ladder. Three hifi evals (`bnsf400` ep100/200/300) would give an
+eight-point IS-vs-ratio curve and settle whether the optimum sits at exactness or above it.
 
 **Caveats.** A local linearisation at the validation sims' true `theta`; the gold SMC puts
 its absolute error at ~2% pooled and ~7% per case, far better than the 10-20% feared, but
