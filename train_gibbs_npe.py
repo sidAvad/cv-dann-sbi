@@ -495,6 +495,24 @@ def main():
     parser.add_argument("--val-eps-draws", type=int, default=1,
                         help="average the validation NLL over this many independent "
                              "noise realisations")
+    parser.add_argument("--laplace-cache", default="",
+                        help="npz from laplace_width.py: the Jacobians and observations "
+                             "for the width diagnostic. J is metric-dependent, so the "
+                             "cache is rejected unless it was built with this run's own "
+                             "metric. Unset disables the diagnostic.")
+    parser.add_argument("--laplace-every", type=int, default=0,
+                        help="log the flow/target width ratio every N epochs into "
+                             "laplace_log_<ts>.csv; 0 disables")
+    parser.add_argument("--laplace-w", type=float, default=0.0,
+                        help="w at which the two widths are compared. 0 uses w_hat. The "
+                             "ratio is w-dependent, so comparing runs needs a shared "
+                             "value.")
+    parser.add_argument("--laplace-samples", type=int, default=2000,
+                        help="posterior draws per case for the flow's own width")
+    parser.add_argument("--laplace-inf-frac", type=float, default=0.8,
+                        help="a parameter counts as informative, and so enters "
+                             "ratio_informative, when its target width95 is below this "
+                             "fraction of the prior's")
     parser.add_argument("--nsf-bins", type=int, default=10)
     parser.add_argument("--nsf-transforms", type=int, default=8)
     parser.add_argument("--nsf-hidden", type=int, default=256)
@@ -914,6 +932,79 @@ def main():
                 "post_std_mean": float(np.mean(u.std(axis=1))),
                 "n_degenerate": int(sc["n_degenerate"])}
 
+    # Laplace width diagnostic: the flow's own 95% width against the width the linearised
+    # Gibbs target has at the same w, on lofi cases with no noise added -- the regime the
+    # Laplace expansion is taken in. Unsupervised and target-internal: it separates a flow
+    # that has not reached its target from a target that is itself wrong, which no score
+    # computed against the target can do. See experiments.md.
+    lap = None
+    if args.laplace_cache:
+        if not args.laplace_every:
+            raise SystemExit("--laplace-cache needs --laplace-every")
+        import laplace_width as lwmod                                # noqa: E402
+        cache = lwmod.load_cache(args.laplace_cache)
+        cmeta = cache["meta"]
+        if (abs(cmeta["ell"] - metric.ell) > 1e-6
+                or cmeta["d_eff"] != metric.d_eff):
+            raise SystemExit(
+                f"--laplace-cache was built on a different metric "
+                f"(ell {cmeta['ell']:.6f} d_eff {cmeta['d_eff']} vs this run's "
+                f"{metric.ell:.6f} / {metric.d_eff}); rebuild it with "
+                f"laplace_width.py --metric-dir pointing at this run's metric")
+        if list(cmeta["param_keys"]) != list(PARAM_KEYS_INFER):
+            raise SystemExit("--laplace-cache has a different parameter order")
+        lap_w = args.laplace_w or w_hat
+        lap_x = torch.from_numpy(cache["x"]).float().to(device)
+        lap_logw = float(np.log(lap_w))
+        lap_lo, lap_hi, lap_logmask = prior_box(args.nested_sim_root,
+                                                list(PARAM_KEYS_INFER))
+        lap_tgt_pp = lwmod.laplace_width95(cache["J"], lap_w, correction,
+                                           per_param=True)
+        lap_target = float(lap_tgt_pp.mean())
+        # Parameters the data barely constrains sit at the prior under both the target and
+        # any sane flow, so including them pulls every ratio toward 1 and hides the signal.
+        # The informative subset is the one the mean ratio is worth reading on.
+        lap_inf = lap_tgt_pp < args.laplace_inf_frac * lwmod.PRIOR_WIDTH95
+        log(f"Laplace width diagnostic: {lap_x.shape[0]} {cmeta['split']} cases, "
+            f"{args.laplace_samples} draws, every {args.laplace_every} epochs at "
+            f"w = {lap_w:.6g}; target width95 = {lap_target:.4f}, "
+            f"{int(lap_inf.sum())}/{lap_inf.size} params informative "
+            f"(< {args.laplace_inf_frac:g} x prior {lwmod.PRIOR_WIDTH95:.4f})"
+            + (" (Sigma_c applied)" if correction is not None else ""))
+        lap = True
+        lap_fh = open(run_dir / f"laplace_log_{ts}.csv", "w", newline="")
+        lap_wr = csv.writer(lap_fh)
+        lap_wr.writerow(["epoch", "w", "flow_width95", "laplace_width95", "ratio",
+                         "ratio_informative", "in_box_frac"]
+                        + [f"ratio_{k}" for k in PARAM_KEYS_INFER])
+
+    def laplace_now():
+        """Flow width95 on the cache's cases, in the same unit-cube coords as the target.
+
+        The observations are the clean lofi phi(f(theta)), not noised: the Laplace is
+        expanded at an observation whose mode sits at theta_true, so feeding a noised
+        draw would compare against the wrong reference. Samples are left unclamped so an
+        over-wide flow is not silently trimmed to the box.
+        """
+        _eval_mode()
+        chunks = []
+        with torch.no_grad():
+            for b in range(0, lap_x.shape[0], args.val_batch):
+                x_b = lap_x[b:b + args.val_batch]
+                lw = torch.full((x_b.shape[0], 1), lap_logw, device=device)
+                d = flow.sample((args.laplace_samples,), condition=_cond(x_b, lw))
+                chunks.append(d.transpose(0, 1).cpu().numpy())        # (B, n, 24)
+        u = to_unit_unclamped(np.concatenate(chunks, 0), lap_lo, lap_hi, lap_logmask)
+        qs = np.percentile(u, [2.5, 97.5], axis=1)
+        fw_pp = (qs[1] - qs[0]).mean(0)                               # (24,)
+        ratio_pp = fw_pp / lap_tgt_pp
+        return {"flow": float(fw_pp.mean()),
+                "ratio": float(fw_pp.mean() / lap_target),
+                "ratio_inf": float(ratio_pp[lap_inf].mean()) if lap_inf.any()
+                else float("nan"),
+                "in_box": float(np.mean(((u >= 0.0) & (u <= 1.0)).all(axis=2))),
+                "ratio_pp": ratio_pp}
+
     flow_end = args.flow_warmup
     enc_end = flow_end + args.enc_warmup
 
@@ -1018,6 +1109,17 @@ def main():
                 f"IS95 {c['is95']:.4f} (skill {c['is95_skill']:+.3f})  "
                 f"cov95 {c['cov95']:.3f}  width95 {c['width95']:.4f}  "
                 f"accept {c['accept_median']:.3f}")
+
+        if lap and epoch % args.laplace_every == 0:
+            c = laplace_now()
+            lap_wr.writerow([epoch, f"{lap_w:.6g}", f"{c['flow']:.6f}",
+                             f"{lap_target:.6f}", f"{c['ratio']:.6f}",
+                             f"{c['ratio_inf']:.6f}", f"{c['in_box']:.4f}"]
+                            + [f"{r:.6f}" for r in c["ratio_pp"]])
+            lap_fh.flush()
+            log(f"       laplace  flow width95 {c['flow']:.4f}  "
+                f"target {lap_target:.4f}  ratio {c['ratio']:.3f}  "
+                f"ratio_inf {c['ratio_inf']:.3f}  in-box {c['in_box']:.3f}")
 
         if args.ckpt_every and epoch % args.ckpt_every == 0:
             save_snapshot(ckpt_dir / f"epoch{epoch:04d}", E, flow, wemb,
