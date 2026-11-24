@@ -928,7 +928,11 @@ def main():
 
     csv_fh = open(run_dir / f"train_log_{ts}.csv", "w", newline="")
     writer = csv.writer(csv_fh)
-    writer.writerow(["epoch", "phase", "train_nll", "val_nll", "seconds"])
+    # since_best is logged whether or not --patience is set, so any patience threshold
+    # can be read off a finished run without rerunning it: the rule with patience N would
+    # have fired at the first epoch whose since_best reaches N.
+    writer.writerow(["epoch", "phase", "train_nll", "val_nll", "seconds",
+                     "best_val", "since_best"])
 
     gibbs_meta_path = ckpt_dir / "gibbs_metric.json"
     log(f"Training: epochs {start_epoch}-{args.max_epochs}, {len(sim_dl)} batches/epoch, lr={args.lr}, "
@@ -980,11 +984,18 @@ def main():
         v = (val_nll_now() if val_pack is not None and args.val_every
              and epoch % args.val_every == 0 else None)
         dt = time.time() - t0
+        since_best = "" if v is None else epoch - (
+            epoch if v < best_val else best_epoch)
         writer.writerow([epoch, ph, f"{train_nll:.5f}",
-                         "" if v is None else f"{v:.5f}", f"{dt:.1f}"])
+                         "" if v is None else f"{v:.5f}", f"{dt:.1f}",
+                         "" if best_val == float("inf") and v is None
+                         else f"{min(best_val, v if v is not None else best_val):.5f}",
+                         since_best])
         csv_fh.flush()
         log(f"ep {epoch:4d} [{ph:4s}]  train_nll {train_nll:.4f}"
-            + ("" if v is None else f"  val_nll {v:.4f}") + f"  ({dt:.0f}s)")
+            + ("" if v is None else f"  val_nll {v:.4f}")
+            + ("" if v is None else f"  since_best {since_best}")
+            + f"  ({dt:.0f}s)")
         last_epoch = epoch
 
         if v is not None and v < best_val:
