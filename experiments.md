@@ -300,7 +300,7 @@ on `(fn, zeta)` and HR -- not negligible. But `calibrate_lowpass` puts the real 
 closest to *unfiltered* hifi, so a perturbation that size would move the benchmark away
 from the reals. Both results agree: do not add the layer.
 
-## The Laplace width diagnostic: the flows have not reached their own target
+## The Laplace width diagnostic: a working instrument, an undecided question
 
 Every score we had measures the flow against data. None of them answers whether the flow
 has reached the Gibbs posterior it was *trained* to target, and that distinction carries
@@ -322,59 +322,70 @@ for 60 cases, 0 failed, under a minute on 48 workers, cached once. Per-epoch cos
 that is one flow sampling pass. `J` is metric-dependent, so a cache is valid only for the
 metric that built it, and `train_gibbs_npe.py` refuses a mismatched one.
 
-**First pass was invalid.** It compared flow widths measured on 1,000 **hifi** cases
-against a Laplace built on 60 **lofi** cases and read hypothesis (a) off the result
-(ratios 0.918 / 0.831 / 0.758, all below 1, concluding every flow overshoots a sound
-target). `scripts/laplace_ladder.py` re-measures the flow on exactly the cache's own
-cases. The ordering survived the error; the absolute level, which is the whole question,
-did not.
+**Two measurement errors, both found after reporting a conclusion.** (1) The first pass
+compared flow widths from 1,000 **hifi** cases against a Laplace built on 60 **lofi**
+cases, and read hypothesis (a) off ratios 0.918 / 0.831 / 0.758.
+`scripts/laplace_ladder.py` re-measures on the cache's own cases. (2) The re-measurement
+was then summarised with a *mean* of per-parameter ratios on the informative subset, which
+read "the arms bracket the target" and was reported as hypothesis (b). That summary is
+dominated by two parameters. `scripts/laplace_estimators.py` prices all of it.
 
-**Result at `w = 1.033` in the real-patient metric, matched cases: the arms bracket the
-target, and hifi improves monotonically with distance ABOVE it.**
+**Estimator sensitivity at `w = 1.033`, real-patient metric, target `width95` 0.7725.**
+RoM = ratio of means, MoR = mean of per-parameter ratios, inf = the 13/24 parameters whose
+target width is under 0.8x the matched prior.
 
-| arm | flow width95 | ratio | ratio_inf | hifi IS |
-|---|---|---|---|---|
-| bnsf800, Lipschitz ceiling 2.0 | 0.747 | 0.967 | **1.277** | -0.022 |
-| bnsf800, no ceiling | 0.674 | 0.872 | **1.033** | -0.232 |
-| bnsf1600, no ceiling | 0.614 | 0.795 | **0.880** | -0.819 |
+| arm | RoM all | MoR all | RoM inf | MoR inf | **median inf** | hifi IS |
+|---|---|---|---|---|---|---|
+| bnsf800, Lipschitz 2.0 | 0.967 | 1.107 | 1.055 | 1.277 | **0.928** | -0.022 |
+| bnsf800, no ceiling | 0.872 | 0.954 | 0.890 | 1.033 | **0.811** | -0.232 |
+| bnsf1600, no ceiling | 0.795 | 0.851 | 0.766 | 0.880 | **0.682** | -0.819 |
 
-Target `width95 = 0.7725`. The arm sitting essentially *on* its Gibbs posterior
-(nolip800, ratio_inf 1.033) scores IS -0.232; the best arm is 28% **wider** than its own
-target; the only arm that genuinely overshoots is bnsf1600 at long training.
+**What is robust: the ordering.** Every estimator ranks the arms the same way, monotone
+with hifi IS. That was never in doubt and is what makes the ratio useful as an instrument.
 
-**This is (b): the Gibbs target is too sharp for hifi.** Being at the target is not
-optimal and being past it is bad, so the useful operating point is deliberately *above*
-it. The ratio remains a usable unsupervised instrument -- it is the only non-likelihood
-signal we have, and it ranks the arms correctly -- but the rule is "hold ratio_inf near
-1.28", not "converge to 1". That number is empirical and tied to this metric and `w`.
+**What is not robust: where 1.0 falls** -- which is the entire (a)-vs-(b) question. Three
+estimators put `lip800` above the target and two put it below. The "above" readings all
+come from mean-of-ratios being inflated by **AVD (4.25) and Tmax_a (1.92)**, while the
+other eleven informative parameters sit at 0.817-0.953. Per-parameter ratios are bounded
+below by 0 and unbounded above, so a mean lets those two dominate. **Use the median**;
+`train_gibbs_npe.py` now logs `ratio_inf_median` as the headline and keeps the mean
+alongside.
 
-**The Lipschitz ceiling works by keeping the flow wide**, which is the mechanism behind
-the -0.21 IS it was known to be worth. Note the consequence: *tightening* the ceiling is
-the right direction, and loosening or removing it is what lets the flow reach and pass the
-target.
+**Conclusion: (a) vs (b) is still undecided, and no flow has reached the target.** On
+every robust summary all three arms are sharper than the Laplace Gibbs posterior, the best
+hifi arm being the least sharp. Since nothing has arrived at the target, what being *at*
+it does on hifi has never been observed, so "the target is too sharp for hifi" remains
+untested rather than supported. The earlier confident readings in both directions were
+estimator artifacts.
 
-**The flow under-responds to `w`, badly.** `ratio_inf` for the Lipschitz arm over
-`w = 1.033 / 7.55 / 75.5` is 1.277 / 1.392 / 1.904, and the all-parameter ratio crosses 1
-inside the window (0.967 -> 1.199). The true target moves 0.7725 -> 0.4590 over that range
-while the flow moves 0.747 -> 0.550. A single-`w` ratio is therefore not a property of an
-arm, and the w-conditioning itself is a defect worth attacking directly.
+**AVD and Tmax_a are a caveat on the instrument itself.** Both are timing parameters, both
+have tight Laplace targets (0.196, 0.408), and the flows are 2-4x wider than the target on
+them. Either the local linearisation is a poor model there -- plausible, since a timing
+shift moves waveform features rather than scaling them, so `d phi / d u` is only locally
+meaningful -- or the flows genuinely fail on those two. Not resolved.
 
-**Epoch trend, bnsf800-Lipschitz.** `ratio_inf` 1.310 / 1.295 / 1.287 / 1.277 at
-ep500/600/700/800: monotone, approaching the target from **above** at roughly 0.01 per 100
-epochs. Training does converge toward the Gibbs posterior; it is simply far from it, and on
-this evidence arriving would be a regression.
+**The flow is narrower than the prior even where the data says little.** On the 11
+uninformative parameters the flows give 0.902 / 0.857 / 0.813 against a true uniform
+`width95` of 0.95. Related: the moment-matched Gaussian prior (`width95` 1.1316) was
+expected to overstate the target by ~19% on those parameters; measured, the overstatement
+is only 5% (target 0.997 vs 0.95), because they are partially informed rather than free.
 
-**Read `ratio_informative`, not `ratio`.** Per-parameter target widths at `w = 1.033` span
-0.187 to 1.083 against a prior width of 1.1316, so 11 of 24 parameters are barely
-constrained and sit at the prior under both the target and any sane flow. The two columns
-disagree on the sign of the finding -- all-parameter ratios read "too sharp" (0.967) where
-the informative subset reads "too wide" (1.277) -- so the subset is the one to trust. The
-informative count is itself `w`-dependent: 13/24 at `w = 1.033`, 23/24 at `w = 75.5`.
+**The Lipschitz ceiling keeps the flow wide**, which is the mechanism behind the -0.21 IS
+it was known to be worth. Tightening it (*lowering* `--sn-ceiling`) is the direction the
+ratio ordering points.
 
-**Caveats.** The width is a local linearisation at the validation sims' true `theta`,
-worth perhaps 10-20% in absolute terms; with the operating point now *defined* by an
-absolute ratio (~1.28) rather than by proximity to 1, that uncertainty propagates directly
-into the rule. It measures width only: right width with the wrong centre scores 1.0.
+**The flow under-responds to `w`.** `median inf` is not yet measured across `w`, but the
+all-parameter ratio for the Lipschitz arm crosses 1 inside the window: 0.967 at `w` 1.033,
+1.022 at 7.55, 1.199 at 75.5, while the target moves 0.7725 -> 0.4590 and the flow only
+0.747 -> 0.550. A single-`w` ratio is therefore not a property of an arm.
+
+**Epoch trend, bnsf800-Lipschitz** (`MoR inf`, the column measured at the time): 1.310 /
+1.295 / 1.287 / 1.277 at ep500/600/700/800 -- monotone toward the target, at roughly 0.01
+per 100 epochs. Direction is robust even if the level is not.
+
+**Caveats.** A local linearisation at the validation sims' true `theta`, worth perhaps
+10-20% in absolute terms. It measures width only: right width with the wrong centre scores
+1.0.
 
 **Owed: SMC on hifi realistic.** This is now the decisive run, not a validation detail.
 The claim is that the Gibbs target is too sharp for hifi; SMC with the lofi simulator at

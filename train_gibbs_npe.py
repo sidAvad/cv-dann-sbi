@@ -975,7 +975,7 @@ def main():
         lap_fh = open(run_dir / f"laplace_log_{ts}.csv", "w", newline="")
         lap_wr = csv.writer(lap_fh)
         lap_wr.writerow(["epoch", "w", "flow_width95", "laplace_width95", "ratio",
-                         "ratio_informative", "in_box_frac"]
+                         "ratio_inf_median", "ratio_inf_mean", "in_box_frac"]
                         + [f"ratio_{k}" for k in PARAM_KEYS_INFER])
 
     def laplace_now():
@@ -1004,9 +1004,16 @@ def main():
         qs = np.percentile(u, [2.5, 97.5], axis=1)
         fw_pp = (qs[1] - qs[0]).mean(0)                               # (24,)
         ratio_pp = fw_pp / lap_tgt_pp
+        # The median, not the mean, over the informative subset: per-parameter ratios are
+        # bounded below by 0 and unbounded above, and a couple of parameters (AVD, Tmax_a)
+        # disagree with the linearisation by 2-4x, which a mean lets dominate the summary.
+        # See experiments.md -- a mean-of-ratios read "above target" where every robust
+        # estimator reads "below".
         return {"flow": float(fw_pp.mean()),
                 "ratio": float(fw_pp.mean() / lap_target),
-                "ratio_inf": float(ratio_pp[lap_inf].mean()) if lap_inf.any()
+                "ratio_inf": float(np.median(ratio_pp[lap_inf])) if lap_inf.any()
+                else float("nan"),
+                "ratio_inf_mean": float(ratio_pp[lap_inf].mean()) if lap_inf.any()
                 else float("nan"),
                 "in_box": float(np.mean(((u >= 0.0) & (u <= 1.0)).all(axis=2))),
                 "ratio_pp": ratio_pp}
@@ -1120,12 +1127,14 @@ def main():
             c = laplace_now()
             lap_wr.writerow([epoch, f"{lap_w:.6g}", f"{c['flow']:.6f}",
                              f"{lap_target:.6f}", f"{c['ratio']:.6f}",
-                             f"{c['ratio_inf']:.6f}", f"{c['in_box']:.4f}"]
+                             f"{c['ratio_inf']:.6f}", f"{c['ratio_inf_mean']:.6f}",
+                             f"{c['in_box']:.4f}"]
                             + [f"{r:.6f}" for r in c["ratio_pp"]])
             lap_fh.flush()
             log(f"       laplace  flow width95 {c['flow']:.4f}  "
                 f"target {lap_target:.4f}  ratio {c['ratio']:.3f}  "
-                f"ratio_inf {c['ratio_inf']:.3f}  in-box {c['in_box']:.3f}")
+                f"ratio_inf(med) {c['ratio_inf']:.3f}  "
+                f"in-box {c['in_box']:.3f}")
 
         if args.ckpt_every and epoch % args.ckpt_every == 0:
             save_snapshot(ckpt_dir / f"epoch{epoch:04d}", E, flow, wemb,
